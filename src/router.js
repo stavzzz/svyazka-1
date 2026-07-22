@@ -1,0 +1,820 @@
+// Оркестратор: update Telegram → доступ → голос→текст → служебные интенты
+// (callback-кнопки, ответы на forceReply) → классификатор → обработчики.
+// Все ответы рендерит код (render.js). Deps инжектятся — тестируемость.
+import { DateTime } from 'luxon';
+import * as R from './render.js';
+import { detectCity, zoneLabel, gmtLabel, getClock } from './tz.js';
+import { rangeFor, fmtDateRu, fmtDayHeader, fmtDayShort, weekdayFull } from './dates.js';
+import { findConflicts } from './conflict.js';
+import { parseWhen } from './timeparse.js';
+import { newPendingKey } from './state.js';
+import { normEvent, viewFromEvent, lineFromEvent, timesFor, buildLinks } from './views.js';
+import { freeSlots, fmtDur } from './slots.js';
+
+const WD_RU = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'];
+
+export function createRouter(deps) {
+  const { tg, gcal, zoom, classifier, transcriber, state, cfg, now = () => Date.now() } = deps;
+
+  const calTz = () => state.data.cache.tz || cfg.fallbackTz;
+  const tzLabel = () => zoneLabel(calTz(), now());
+
+  function classifyCtx() {
+    const tz = calTz();
+    const nowDt = DateTime.fromMillis(now(), { zone: tz });
+    return {
+      todayISO: nowDt.toISODate(),
+      tomorrowISO: nowDt.plus({ days: 1 }).toISODate(),
+      weekdayRu: WD_RU[nowDt.weekday - 1],
+      tz,
+    };
+  }
+
+  // ── Кэш календаря ────────────────────────────────────────────
+  async function refreshCache() {
+    const nowMs = now();
+    const tz = await gcal.getCalendarTz();
+    const min = new Date(nowMs - 24 * 3600_000).toISOString();
+    const max = new Date(nowMs + 60 * 24 * 3600_000).toISOString();
+    const events = (await gcal.listEvents(min, max)).map(normEvent);
+    state.data.cache = { tz, events, fetchedAt: nowMs };
+    state.save();
+  }
+
+  // ── Представление ещё не созданного события (pending) ───────
+  function pendingView(ev) {
+    const start = DateTime.fromISO(`${ev.date}T${ev.time}`, { zone: ev.tz });
+    const end = start.plus({ minutes: ev.durationMin });
+    const local = start.setZone(calTz());
+    const localEnd = end.setZone(calTz());
+    const t1 = local.toFormat('HH:mm');
+    const view = {
+      title: ev.title,
+      dateRu: fmtDateRu(local),
+      clock: getClock(t1), t1, t2: localEnd.toFormat('HH:mm'),
+      zone: zoneLabel(calTz(), start.toMillis()),
+      alt: null,
+      attendees: ev.attendees || [],
+      location: ev.location || '',
+      description: ev.description || '',
+    };
+    if (ev.tz !== calTz() && zoneLabel(ev.tz, start.toMillis()) !== view.zone) {
+      view.alt = {
+        clock: getClock(start.toFormat('HH:mm')),
+        t1: start.toFormat('HH:mm'), t2: end.toFormat('HH:mm'),
+        zone: zoneLabel(ev.tz, start.toMillis()),
+      };
+    }
+    return { view, startMs: start.toMillis(), endMs: end.toMillis(), start, end };
+  }
+
+  // Свободные окна в день планируемой встречи, куда она влезает по длительности.
+  // Считается по кэшу — как и сам детект конфликта.
+  function conflictDaySlots(ev, startMs) {
+    const tz = calTz();
+    const day = DateTime.fromMillis(startMs, { zone: tz }).startOf('day');
+    const workStart = day.plus({ hours: 9 }).toMillis();
+    const workEnd = day.plus({ hours: 21 }).toMillis();
+    const from = Math.max(now(), workStart);
+    const busy = state.data.cache.events.filter((e) =>
+      e.status !== 'cancelled' && !e.allDay && !e.transparent &&
+      e.endMs > day.toMillis() && e.startMs < day.plus({ days: 1 }).toMillis());
+    const minMs = Math.max(30, ev.durationMin) * 60_000;
+    return freeSlots(busy, from, workEnd, minMs).map((s) => {
+      const t1 = DateTime.fromMillis(s.startMs, { zone: tz }).toFormat('HH:mm');
+      const t2 = DateTime.fromMillis(s.endMs, { zone: tz }).toFormat('HH:mm');
+      return { clock: getClock(t1), t1, t2, dur: fmtDur(s.endMs - s.startMs) };
+    });
+  }
+
+  // ── Создание: конфликт-гейт → создать ────────────────────────
+  async function resolveAndMaybeCreate(chatId, ev) {
+    const { startMs, endMs, view } = pendingView(ev);
+    const conflicts = findConflicts(startMs, endMs, state.data.cache.events.filter((e) => !e.allDay && !e.transparent));
+    if (conflicts.length) {
+      const key = newPendingKey(chatId);
+      const cv = conflicts.map((c) => {
+        const t = timesFor(c, calTz());
+        return { title: c.summary, t1: t.t1, t2: t.t2, zone: t.zone };
+      });
+      const html = R.rConflict(view, cv, conflictDaySlots(ev, startMs));
+      const sent = await tg.send(chatId, html, { buttons: R.conflictButtons(key) });
+      state.data.pending[chatId] = { key, kind: 'confirm', action: 'create', ev, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+      state.save();
+      return;
+    }
+    await doCreate(chatId, ev);
+  }
+
+  // Жизненный цикл кнопок (заметка telegram-instant-buttons): после нажатия
+  // карточка перерисовывается БЕЗ кнопок, внизу — выбранный статус.
+  async function stripButtons(chatId, pending, label) {
+    if (!pending?.cardHtml || !pending?.promptMsgId) return;
+    await tg.edit(chatId, pending.promptMsgId, pending.cardHtml + `\n\n➡️ ${label}`, {});
+  }
+
+  async function doCreate(chatId, ev) {
+    const { start, end } = pendingView(ev);
+    // Zoom — в каждую встречу (решение Стаса); сбой Zoom не блокирует создание.
+    let zoomUrl = '';
+    if (zoom.enabled) {
+      try {
+        const z = await zoom.createMeeting(ev.title, start.toFormat("yyyy-MM-dd'T'HH:mm:ss"), ev.durationMin, ev.tz);
+        zoomUrl = z.joinUrl;
+      } catch (e) { console.error('zoom create failed:', e.message); }
+    }
+    let description = ev.description || '';
+    if (zoomUrl) description = (description ? description + '\n\n' : '') + `Zoom: ${zoomUrl}`;
+    const raw = await gcal.createEvent({
+      summary: ev.title,
+      startISO: start.toISO(),
+      endISO: end.toISO(),
+      tz: ev.tz,
+      attendees: ev.attendees,
+      location: ev.location,
+      description,
+    }, { meet: true });
+    await refreshCache();
+    const nev = normEvent(raw);
+    if (!nev.tz) nev.tz = ev.tz;
+    await tg.send(chatId, R.rCreated(viewFromEvent(nev, calTz())));
+  }
+
+  // ── Перенос существующего события ────────────────────────────
+  async function doMove(chatId, pending) {
+    const { ev, eventId } = pending;
+    const { start, end } = pendingView(ev);
+    const raw = await gcal.patchEvent(eventId, {
+      start: { dateTime: start.toISO(), timeZone: ev.tz },
+      end: { dateTime: end.toISO(), timeZone: ev.tz },
+    });
+    await refreshCache();
+    await tg.send(chatId, R.rMoved([viewFromEvent(normEvent(raw), calTz())]));
+  }
+
+  async function resolveAndMaybeMove(chatId, pending) {
+    const { startMs, endMs, view } = pendingView(pending.ev);
+    const conflicts = findConflicts(startMs, endMs,
+      state.data.cache.events.filter((e) => !e.allDay && !e.transparent), pending.eventId);
+    if (conflicts.length) {
+      const key = newPendingKey(chatId);
+      const cv = conflicts.map((c) => {
+        const t = timesFor(c, calTz());
+        return { title: c.summary, t1: t.t1, t2: t.t2, zone: t.zone };
+      });
+      const html = R.rConflict(view, cv, conflictDaySlots(pending.ev, startMs));
+      const sent = await tg.send(chatId, html, { buttons: R.conflictButtons(key) });
+      state.data.pending[chatId] = { ...pending, key, kind: 'confirm', createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+      state.save();
+      return;
+    }
+    await doMove(chatId, pending);
+  }
+
+  // ── Поиск событий по названию (кэш, будущее окно) ────────────
+  function searchByTitle(title) {
+    const q = (title || '').trim().toLowerCase();
+    if (!q) return [];
+    return state.data.cache.events.filter((e) =>
+      e.status !== 'cancelled' &&
+      e.endMs > now() - 3600_000 &&
+      e.summary.toLowerCase().includes(q));
+  }
+
+  // Фолбэк: классификатор не вытащил название (запятые, обороты) —
+  // ищем названия встреч из кэша прямо в тексте сообщения. Детерминированно.
+  function searchInText(text) {
+    const t = (text || '').toLowerCase();
+    if (!t) return [];
+    const seen = new Set();
+    return state.data.cache.events.filter((e) => {
+      if (e.status === 'cancelled' || e.endMs <= now() - 3600_000) return false;
+      const s = e.summary.toLowerCase();
+      if (s.length < 3 || !t.includes(s)) return false;
+      if (seen.has(e.id)) return false;
+      seen.add(e.id);
+      return true;
+    });
+  }
+
+  // ── Обработчики интентов ─────────────────────────────────────
+
+  async function handleCreate(chatId, c) {
+    const city = c.city ? detectCity(c.city) : null;
+    const ev = {
+      title: (c.title || 'Встреча').trim() || 'Встреча',
+      date: c.date || DateTime.fromMillis(now(), { zone: calTz() }).toISODate(),
+      time: c.time_start || '',
+      tz: city ? city.tz : calTz(),
+      durationMin: computeDuration(c),
+      attendees: c.attendees || [],
+      location: c.location || '',
+      description: c.description || '',
+    };
+    if (!ev.time) {
+      const key = newPendingKey(chatId);
+      const msg = await tg.send(chatId, R.rAskTime(ev.title, zoneLabel(calTz(), now())), { forceReply: true });
+      state.data.pending[chatId] = { key, kind: 'await_time', action: 'create', ev, createdAt: now(), promptMsgId: msg.message_id };
+      state.save();
+      return;
+    }
+    await resolveAndMaybeCreate(chatId, ev);
+  }
+
+  function computeDuration(c) {
+    if (c.time_start && c.time_end) {
+      const [h1, m1] = c.time_start.split(':').map(Number);
+      const [h2, m2] = c.time_end.split(':').map(Number);
+      const d = (h2 * 60 + m2) - (h1 * 60 + m1);
+      if (d > 0) return d;
+    }
+    const d = parseInt(c.duration_min, 10);
+    return d > 0 ? d : 60;
+  }
+
+  async function handleSchedule(chatId, intent, c) {
+    // Классификатор не дал дату для weekday/specific_date → показываем сегодня.
+    if ((intent === 'weekday' || intent === 'specific_date') && !/^\d{4}-\d{2}-\d{2}$/.test(c.date || '')) {
+      intent = 'today';
+    }
+    let range;
+    try {
+      range = rangeFor(intent, { date: c.date }, calTz(), now());
+    } catch {
+      await tg.send(chatId, R.rFail());
+      return;
+    }
+    let events;
+    try {
+      events = (await gcal.listEvents(range.start.toUTC().toISO(), range.end.toUTC().toISO()))
+        .map(normEvent).filter((e) => e.status !== 'cancelled');
+    } catch (e) {
+      console.error('list failed:', e.message);
+      await tg.send(chatId, R.rCalError());
+      return;
+    }
+    if (range.kind === 'day') {
+      await tg.send(chatId, R.rDaySchedule(range.header, fmtDayHeader(range.start), events.map((e) => lineFromEvent(e, calTz()))));
+    } else {
+      const days = [];
+      for (let d = range.start; d < range.end; d = d.plus({ days: 1 })) {
+        const dayEvents = events.filter((e) => {
+          const s = DateTime.fromMillis(e.startMs, { zone: calTz() });
+          return s.hasSame(d, 'day');
+        });
+        if (dayEvents.length) days.push({ hdr: fmtDayShort(d), lines: dayEvents.map((e) => lineFromEvent(e, calTz())) });
+      }
+      await tg.send(chatId, R.rWeekSchedule(range.header, days));
+    }
+  }
+
+  function ambiguousItems(matches) {
+    return matches.map((m) => {
+      const tt = timesFor(m, calTz());
+      return { title: m.summary, dayMonth: fmtDateRu(tt.local).replace(/ \d{4}$/, ''), clock: tt.clock, t1: tt.t1, zone: tt.zone };
+    });
+  }
+
+  // «Найдено несколько» → pending выбора: кнопки-номера или цифра сообщением.
+  async function askWhich(chatId, matches, action, payload) {
+    const key = newPendingKey(chatId);
+    const html = R.rAmbiguous(ambiguousItems(matches), action);
+    const sent = await tg.send(chatId, html, { buttons: R.pickButtons(key, matches.length, { withAll: action === 'delete' }) });
+    state.data.pending[chatId] = {
+      key, kind: 'choose', action, candidates: matches, c: payload, createdAt: now(),
+      cardHtml: html, promptMsgId: sent.message_id,
+    };
+    state.save();
+  }
+
+  // Выбранная встреча из «Найдено несколько» → продолжаем исходную операцию.
+  // idx: номер (0-based) или 'all' — все сразу (только для удаления).
+  async function resolveChoice(chatId, pending, idx) {
+    const targets = idx === 'all'
+      ? pending.candidates
+      : [pending.candidates[idx]].filter(Boolean);
+    if (!targets.length || (idx === 'all' && pending.action !== 'delete')) {
+      await tg.send(chatId, R.rStaleButton());
+      return;
+    }
+    delete state.data.pending[chatId];
+    state.save();
+    await stripButtons(chatId, pending, idx === 'all' ? '☑️ Выбрано: все' : `☑️ Выбрано: ${idx + 1}`);
+    if (pending.action === 'delete') {
+      const key = newPendingKey(chatId);
+      const html = R.rConfirmDelete(targets.map((t) => viewFromEvent(t, calTz())));
+      const sent = await tg.send(chatId, html, { buttons: R.deleteButtons(key) });
+      state.data.pending[chatId] = { key, kind: 'confirm', action: 'delete', events: targets, notFound: [], createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+      state.save();
+      return;
+    }
+    await applyUpdate(chatId, targets[0], pending.c);
+  }
+
+  async function handleDelete(chatId, c, text) {
+    const titles = (c.titles && c.titles.length ? c.titles : [c.title]).filter(Boolean);
+    const found = [];
+    let notFound = [];
+    for (const t of titles) {
+      const matches = searchByTitle(t);
+      if (matches.length > 1) {
+        await askWhich(chatId, matches, 'delete', c);
+        return;
+      }
+      if (matches.length === 1) found.push(matches[0]);
+      else notFound.push(t);
+    }
+    // Фолбэк: названий нет или ни одно не нашлось — ищем имена встреч в самом тексте
+    if (!found.length) {
+      const byText = searchInText(text);
+      if (byText.length) { found.push(...byText); notFound = []; }
+    }
+    if (!found.length) { await tg.send(chatId, R.rNotFound(titles.length ? titles : ['(без названия)'])); return; }
+
+    // Защита от случайного удаления: подтверждение кнопками
+    const key = newPendingKey(chatId);
+    const html = R.rConfirmDelete(found.map((e) => viewFromEvent(e, calTz())), notFound);
+    const sent = await tg.send(chatId, html, { buttons: R.deleteButtons(key) });
+    state.data.pending[chatId] = {
+      key, kind: 'confirm', action: 'delete',
+      events: found, notFound, createdAt: now(),
+      cardHtml: html, promptMsgId: sent.message_id,
+    };
+    state.save();
+  }
+
+  // Массовые операции: «удали/перенеси все встречи за период» (с подтверждением).
+  const CARD_CAP = 12; // не раздуваем карточку сверх лимита Telegram
+
+  async function handleBulk(chatId, c, kind) {
+    let intent = ['today', 'tomorrow', 'week', 'next_week', 'specific_date'].includes(c.range) ? c.range : 'week';
+    if (intent === 'specific_date' && !/^\d{4}-\d{2}-\d{2}$/.test(c.date || '')) intent = 'today';
+    const range = rangeFor(intent, { date: c.date }, calTz(), now());
+    let events;
+    try {
+      events = (await gcal.listEvents(range.start.toUTC().toISO(), range.end.toUTC().toISO()))
+        .map(normEvent)
+        .filter((e) => e.status !== 'cancelled' && !e.allDay && e.endMs > now());
+    } catch (e) {
+      console.error('bulk list failed:', e.message);
+      await tg.send(chatId, R.rCalError());
+      return;
+    }
+    if (!events.length) { await tg.send(chatId, R.rNoEventsRange(range.header)); return; }
+
+    const views = events.slice(0, CARD_CAP).map((e) => viewFromEvent(e, calTz()));
+    const more = Math.max(0, events.length - CARD_CAP);
+    const key = newPendingKey(chatId);
+    if (kind === 'delete') {
+      const html = R.rConfirmDelete(views, [], more);
+      const sent = await tg.send(chatId, html, { buttons: R.deleteButtons(key) });
+      state.data.pending[chatId] = { key, kind: 'confirm', action: 'delete', events, notFound: [], createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+    } else {
+      const shiftDays = parseInt(c.shift_days, 10) || 7;
+      const html = R.rConfirmMove(views, shiftDays, more);
+      const sent = await tg.send(chatId, html, { buttons: R.moveButtons(key) });
+      state.data.pending[chatId] = { key, kind: 'confirm', action: 'move_all', events, shiftDays, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+    }
+    state.save();
+  }
+
+  async function doMoveAll(chatId, pending) {
+    const moved = [];
+    for (const ev of pending.events) {
+      const tz = ev.tz || calTz();
+      const s = DateTime.fromMillis(ev.startMs, { zone: tz }).plus({ days: pending.shiftDays });
+      const e = DateTime.fromMillis(ev.endMs, { zone: tz }).plus({ days: pending.shiftDays });
+      try {
+        const raw = await gcal.patchEvent(ev.id, {
+          start: { dateTime: s.toISO(), timeZone: tz },
+          end: { dateTime: e.toISO(), timeZone: tz },
+        });
+        moved.push(normEvent(raw));
+      } catch (err) { console.error('bulk move failed:', err.message); }
+    }
+    await refreshCache();
+    if (!moved.length) { await tg.send(chatId, R.rCalError()); return; }
+    await tg.send(chatId, R.rMoved(moved.slice(0, CARD_CAP).map((m) => viewFromEvent(m, calTz()))));
+  }
+
+  async function doDelete(chatId, pending) {
+    for (const ev of pending.events) {
+      try { await gcal.deleteEvent(ev.id); } catch (e) {
+        console.error('delete failed:', e.message);
+        await tg.send(chatId, R.rCalError());
+        return;
+      }
+    }
+    await refreshCache();
+    await tg.send(chatId, R.rDeleted(pending.events.map((e) => viewFromEvent(e, calTz())), pending.notFound));
+  }
+
+  async function handleUpdate(chatId, c, text) {
+    let matches = searchByTitle(c.title || '');
+    if (!matches.length) matches = searchInText(text); // фолбэк по тексту сообщения
+    if (!matches.length) { await tg.send(chatId, R.rNotFound([c.title || '(без названия)'])); return; }
+    if (matches.length > 1) {
+      await askWhich(chatId, matches, 'update', c);
+      return;
+    }
+    await applyUpdate(chatId, matches[0], c);
+  }
+
+  async function applyUpdate(chatId, target, c) {
+    const timeChanged = Boolean(c.date || c.time_start);
+
+    if (timeChanged) {
+      const city = c.city ? detectCity(c.city) : null;
+      const tz = city ? city.tz : (target.tz || calTz());
+      const oldStart = DateTime.fromMillis(target.startMs, { zone: tz });
+      const oldDurMin = Math.round((target.endMs - target.startMs) / 60000);
+      const ev = {
+        title: target.summary,
+        date: c.date || oldStart.toISODate(),
+        time: c.time_start || oldStart.toFormat('HH:mm'),
+        tz,
+        durationMin: parseInt(c.duration_min, 10) > 0 ? parseInt(c.duration_min, 10) : oldDurMin,
+      };
+      await resolveAndMaybeMove(chatId, { kind: 'confirm', action: 'move', ev, eventId: target.id });
+      return;
+    }
+
+    // Изменения без переноса: длительность / участники / описание
+    const patch = {};
+    if (parseInt(c.duration_min, 10) > 0) {
+      const end = DateTime.fromMillis(target.startMs).plus({ minutes: parseInt(c.duration_min, 10) });
+      patch.end = { dateTime: end.toISO(), timeZone: target.tz || calTz() };
+    }
+    if (c.attendees_add?.length) {
+      const emails = new Set([...target.attendees, ...c.attendees_add]);
+      patch.attendees = [...emails].map((e) => ({ email: e }));
+    }
+    if (c.description) {
+      const zoomUrl = target.zoom;
+      patch.description = c.description + (zoomUrl ? `\n\nZoom: ${zoomUrl}` : '');
+    }
+    if (!Object.keys(patch).length) { await tg.send(chatId, R.rFail()); return; }
+    try {
+      const raw = await gcal.patchEvent(target.id, patch);
+      await refreshCache();
+      await tg.send(chatId, R.rUpdated(viewFromEvent(normEvent(raw), calTz())));
+    } catch (e) {
+      console.error('patch failed:', e.message);
+      await tg.send(chatId, R.rCalError());
+    }
+  }
+
+  async function handleSetTz(chatId, text, c) {
+    const city = detectCity(text) || (c.city ? detectCity(c.city) : null);
+    if (!city) { await tg.send(chatId, R.rTzUnknown()); return; }
+    try {
+      await gcal.setCalendarTz(city.tz);
+      state.data.cache.tz = city.tz;
+      state.save();
+      await tg.send(chatId, R.rTzSwitched(city.name, city.tz, gmtLabel(city.tz, now())));
+    } catch (e) {
+      console.error('set tz failed:', e.message);
+      await tg.send(chatId, R.rCalError());
+    }
+  }
+
+  async function handleGetTz(chatId) {
+    const tz = calTz();
+    const nowHM = DateTime.fromMillis(now(), { zone: tz }).toFormat('HH:mm');
+    await tg.send(chatId, R.rTzCurrent(zoneLabel(tz, now()), tz, gmtLabel(tz, now()), nowHM));
+  }
+
+  // ── Команды меню: ЧИСТЫЙ код, ноль токенов (правило из заметки
+  //    telegram-instant-buttons-openclaw: меню и списки рисует код) ──
+  async function handleNext(chatId) {
+    let events;
+    try {
+      const nowMs = now();
+      events = (await gcal.listEvents(new Date(nowMs).toISOString(), new Date(nowMs + 60 * 24 * 3600_000).toISOString()))
+        .map(normEvent)
+        .filter((e) => e.status !== 'cancelled' && !e.allDay && e.startMs > nowMs)
+        .sort((a, b) => a.startMs - b.startMs);
+    } catch (e) {
+      console.error('next failed:', e.message);
+      await tg.send(chatId, R.rCalError());
+      return;
+    }
+    if (!events.length) { await tg.send(chatId, R.rNextNone()); return; }
+    await tg.send(chatId, R.rNext(viewFromEvent(events[0], calTz())));
+  }
+
+  // Рабочее окно для свободных слотов: 09:00–21:00 в зоне календаря.
+  function daySlots(day, busy, tz) {
+    const workStart = day.plus({ hours: 9 }).toMillis();
+    const workEnd = day.plus({ hours: 21 }).toMillis();
+    const from = Math.max(now(), workStart);
+    return freeSlots(busy, from, workEnd).map((s) => {
+      const t1 = DateTime.fromMillis(s.startMs, { zone: tz }).toFormat('HH:mm');
+      const t2 = DateTime.fromMillis(s.endMs, { zone: tz }).toFormat('HH:mm');
+      return { clock: getClock(t1), t1, t2, dur: fmtDur(s.endMs - s.startMs) };
+    });
+  }
+
+  async function listBusy(fromISO, toISO) {
+    return (await gcal.listEvents(fromISO, toISO))
+      .map(normEvent)
+      .filter((e) => e.status !== 'cancelled' && !e.allDay && !e.transparent);
+  }
+
+  async function handleFree(chatId) {
+    const tz = calTz();
+    const day = DateTime.fromMillis(now(), { zone: tz }).startOf('day');
+    let busy;
+    try {
+      busy = await listBusy(day.toUTC().toISO(), day.plus({ days: 1 }).toUTC().toISO());
+    } catch (e) {
+      console.error('free failed:', e.message);
+      await tg.send(chatId, R.rCalError());
+      return;
+    }
+    await tg.send(chatId, R.rFreeSlots(fmtDayHeader(day), daySlots(day, busy, tz)));
+  }
+
+  async function handleFreeWeek(chatId, nextWeek) {
+    const tz = calTz();
+    const range = rangeFor(nextWeek ? 'next_week' : 'week', {}, tz, now());
+    let busy;
+    try {
+      busy = await listBusy(range.start.toUTC().toISO(), range.end.toUTC().toISO());
+    } catch (e) {
+      console.error('free week failed:', e.message);
+      await tg.send(chatId, R.rCalError());
+      return;
+    }
+    const today = DateTime.fromMillis(now(), { zone: tz }).startOf('day');
+    const days = [];
+    for (let d = range.start; d < range.end; d = d.plus({ days: 1 })) {
+      if (d < today) continue; // прошедшие дни этой недели не показываем
+      const slots = daySlots(d, busy, tz);
+      if (slots.length) days.push({ hdr: fmtDayShort(d), slots });
+    }
+    const header = nextWeek
+      ? range.header.replace('на следующую неделю', 'на следующей неделе')
+      : `на этой неделе (${range.header.replace('на ', '')})`;
+    await tg.send(chatId, R.rFreeWeek(header, days));
+  }
+
+  // → true, если текст был /командой и обработан кодом (без классификатора).
+  // Неизвестные /команды тоже гасятся кодом — в модель не проваливаются.
+  async function handleMenuCommand(chatId, text) {
+    const m = text.match(/^\/([a-z_]+)\b/i);
+    if (!m) return false;
+    switch (m[1].toLowerCase()) {
+      case 'today': await handleSchedule(chatId, 'today', {}); break;
+      case 'tomorrow': await handleSchedule(chatId, 'tomorrow', {}); break;
+      case 'week': await handleSchedule(chatId, 'week', {}); break;
+      case 'tz': await handleGetTz(chatId); break;
+      case 'next': await handleNext(chatId); break;
+      case 'free': await handleFree(chatId); break;
+      case 'free_week': await handleFreeWeek(chatId, false); break;
+      case 'free_next': await handleFreeWeek(chatId, true); break;
+      case 'add': await tg.send(chatId, R.rAskWhat(), { forceReply: true }); break;
+      case 'reminders':
+        await tg.send(chatId, R.rReminderSettings(state.data.settings, tzLabel()),
+          { buttons: R.settingsButtons(state.data.settings) });
+        break;
+      case 'new': {
+        const hadPending = Boolean(state.data.pending[chatId]);
+        delete state.data.pending[chatId];
+        state.save();
+        await tg.send(chatId, R.rReset(hadPending));
+        break;
+      }
+      default: await tg.send(chatId, R.rUnknownCmd());
+    }
+    return true;
+  }
+
+  // ── Callback-кнопки: cal:<action>:<pending_key> ──────────────
+  // Кнопки настроек: set:<что>[:значение] → мутация settings + перерисовка карточки.
+  async function handleSettingsCallback(cb) {
+    const chatId = cb.message.chat.id;
+    const s = state.data.settings;
+    const parts = (cb.data || '').split(':'); // ['set', код, ...значение]
+    const code = parts[1];
+    const val = parts.slice(2).join(':');
+    switch (code) {
+      case 'mo': s.morning.enabled = !s.morning.enabled; break;
+      case 'md': {
+        const d = Number(val);
+        s.morning.days = s.morning.days.includes(d)
+          ? s.morning.days.filter((x) => x !== d)
+          : [...s.morning.days, d].sort((a, b) => a - b);
+        break;
+      }
+      case 'mt': s.morning.time = val; break;
+      case 't': s.tiers[val] = !s.tiers[val]; break;
+      case 'wo': s.weekly.enabled = !s.weekly.enabled; break;
+      case 'wt': {
+        const times = ['08:00', '09:00', '10:00', '18:00'];
+        s.weekly.time = times[(times.indexOf(s.weekly.time) + 1) % times.length];
+        break;
+      }
+      default: return;
+    }
+    state.save();
+    await tg.edit(chatId, cb.message.message_id,
+      R.rReminderSettings(s, tzLabel()), { buttons: R.settingsButtons(s) });
+  }
+
+  async function handleCallback(cb) {
+    await tg.answerCallback(cb.id);
+    const chatId = cb.message?.chat?.id;
+    if (!chatId || cb.from?.id !== cfg.ownerChatId) return;
+    if ((cb.data || '').startsWith('set:')) { await handleSettingsCallback(cb); return; }
+
+    // Выбор из «Найдено несколько»: cal:pick:<key>:<idx|all>
+    const pick = /^cal:pick:([^:]+):(\d+|all)$/.exec(cb.data || '');
+    if (pick) {
+      const pending = state.data.pending[chatId];
+      if (!pending || pending.kind !== 'choose' || pending.key !== pick[1]) {
+        await tg.send(chatId, R.rStaleButton());
+        return;
+      }
+      await resolveChoice(chatId, pending, pick[2] === 'all' ? 'all' : Number(pick[2]));
+      return;
+    }
+
+    const m = /^cal:(add|reschedule|cancel):(.+)$/.exec(cb.data || '');
+    if (!m) { await tg.send(chatId, R.rStaleButton()); return; }
+    const [, action, key] = m;
+    const pending = state.data.pending[chatId];
+    if (!pending || pending.key !== key) { await tg.send(chatId, R.rStaleButton()); return; }
+
+    if (action === 'cancel') {
+      delete state.data.pending[chatId];
+      state.save();
+      const noLabel = pending.action === 'delete' || pending.action === 'move_all' ? '❌ Нет' : '❌ Отмена';
+      await stripButtons(chatId, pending, noLabel);
+      if (pending.action === 'delete') { await tg.send(chatId, R.rDeleteCancelled()); return; }
+      if (pending.action === 'move_all') { await tg.send(chatId, R.rMoveCancelled()); return; }
+      const { view } = pendingView(pending.ev);
+      await tg.send(chatId, R.rCancelled(view));
+      return;
+    }
+    if (action === 'add') {
+      delete state.data.pending[chatId];
+      state.save();
+      const yesLabel = pending.action === 'delete' ? '✅ Да, удалить'
+        : pending.action === 'move_all' ? '✅ Да, перенести' : '✅ Всё равно';
+      await stripButtons(chatId, pending, yesLabel);
+      if (pending.action === 'delete') await doDelete(chatId, pending);
+      else if (pending.action === 'move_all') await doMoveAll(chatId, pending);
+      else if (pending.action === 'move') await doMove(chatId, pending);
+      else await doCreate(chatId, pending.ev);
+      return;
+    }
+    if (pending.action === 'delete' || pending.action === 'move_all') { await tg.send(chatId, R.rStaleButton()); return; }
+    // reschedule → просим новое время (forceReply)
+    await stripButtons(chatId, pending, '🔁 Перенести');
+    const msg = await tg.send(chatId, R.rAskNewTime(zoneLabel(calTz(), now())), { forceReply: true });
+    state.data.pending[chatId] = { ...pending, kind: 'await_reschedule', createdAt: now(), promptMsgId: msg.message_id };
+    state.save();
+  }
+
+  // ── Ответ на forceReply (уточнение времени / новое время) ────
+  // Правило А (согласовано 2026-07-22): время без города — в зоне КАЛЕНДАРЯ,
+  // город в ответе всегда побеждает.
+  async function handleForceReplyAnswer(chatId, text, pending) {
+    const parsed = parseWhen(text, calTz(), now());
+    const ev = { ...pending.ev };
+    let gotTime = false; // в ответе должно быть НОВОЕ время (или хотя бы дата)
+    if (parsed?.time) { ev.time = parsed.time; gotTime = true; }
+    if (parsed?.date) ev.date = parsed.date;
+    ev.tz = parsed?.tz || calTz();
+
+    // В ответе наговорили не только время, а ещё детали (длительность, описание,
+    // место, участники) — вытаскиваем их классификатором и вливаем в встречу.
+    if (text.length > 40) {
+      try {
+        const c = await classifier.classify(text, classifyCtx());
+        if (c.intent === 'create' || c.intent === 'update') {
+          const dur = parseInt(c.duration_min, 10);
+          if (dur > 0) ev.durationMin = dur;
+          if (c.description) ev.description = c.description;
+          if (c.location) ev.location = c.location;
+          const emails = [...(c.attendees || []), ...(c.attendees_add || [])];
+          if (emails.length) ev.attendees = [...new Set([...(ev.attendees || []), ...emails])];
+          // время словами («на десять вечера») мог поймать только классификатор
+          if (!gotTime && /^\d{2}:\d{2}$/.test(c.time_start || '')) {
+            ev.time = c.time_start;
+            gotTime = true;
+            const ct = c.city ? detectCity(c.city) : null;
+            if (ct) ev.tz = ct.tz;
+          }
+        }
+      } catch (e) { console.error('detail merge failed:', e.message); }
+    }
+
+    if ((!gotTime && !parsed?.date) || !ev.time) { await tg.send(chatId, R.rBadTime(tzLabel())); return; }
+    delete state.data.pending[chatId];
+    state.save();
+    if (pending.action === 'move') await resolveAndMaybeMove(chatId, { ...pending, ev });
+    else await resolveAndMaybeCreate(chatId, ev);
+  }
+
+  // ── Главный обработчик update ────────────────────────────────
+  async function handleUpdateObj(u) {
+    try {
+      if (u.callback_query) { await handleCallback(u.callback_query); return; }
+      const msg = u.message;
+      if (!msg) return;
+      const chatId = msg.chat?.id;
+      if (msg.from?.id !== cfg.ownerChatId) return; // личный секретарь — только владелец
+
+      let text = msg.text || '';
+      if (msg.voice || msg.audio) {
+        try {
+          const fileId = (msg.voice || msg.audio).file_id;
+          const buf = await tg.getVoice(fileId);
+          text = await transcriber.transcribe(buf);
+        } catch (e) {
+          console.error('stt failed:', e.message);
+          await tg.send(chatId, R.rFail());
+          return;
+        }
+      }
+      if (!text.trim()) return;
+
+      if (/^\/(start|help)\b/.test(text)) {
+        await tg.send(chatId, R.rWelcome());
+        return;
+      }
+
+      // Команды меню — чистый код, классификатор не вызывается
+      if (/^\//.test(text) && !state.data.cache.tz) await refreshCache().catch(() => {});
+      if (await handleMenuCommand(chatId, text)) return;
+
+      // Выбор цифрой (или словом «все») при «Найдено несколько встреч»
+      const choosing = state.data.pending[chatId];
+      if (choosing && choosing.kind === 'choose') {
+        if (choosing.action === 'delete' && /^\s*вс[её]\b/i.test(text)) {
+          await resolveChoice(chatId, choosing, 'all');
+          return;
+        }
+        const num = /^\s*(\d{1,2})/.exec(text);
+        if (num) {
+          const idx = Number(num[1]) - 1;
+          if (idx >= 0 && idx < choosing.candidates.length) {
+            await resolveChoice(chatId, choosing, idx);
+            return;
+          }
+        }
+      }
+
+      // Ответ на forceReply-вопрос о времени. Контекст не теряем (глюк с «на 25:00»):
+      // пока висит ожидание, ЛЮБОЕ сообщение с распознаваемым временем — это ответ,
+      // даже если оно пришло не reply'ем (например, после «⚠️ Не понял время»).
+      const pending = state.data.pending[chatId];
+      if (pending && (pending.kind === 'await_time' || pending.kind === 'await_reschedule')) {
+        const isReply = msg.reply_to_message &&
+          (msg.reply_to_message.message_id === pending.promptMsgId ||
+           /На какое время/.test(msg.reply_to_message.text || ''));
+        const parsed = parseWhen(text, calTz(), now());
+        if (isReply || (parsed && parsed.time)) {
+          await handleForceReplyAnswer(chatId, text, pending);
+          return;
+        }
+      }
+
+      // Классификация
+      if (!state.data.cache.tz) await refreshCache().catch(() => {});
+      const tz = calTz();
+      const nowDt = DateTime.fromMillis(now(), { zone: tz });
+      const c = await classifier.classify(text, {
+        todayISO: nowDt.toISODate(),
+        tomorrowISO: nowDt.plus({ days: 1 }).toISODate(),
+        weekdayRu: WD_RU[nowDt.weekday - 1],
+        tz,
+      });
+
+      switch (c.intent) {
+        case 'create': await handleCreate(chatId, c); break;
+        case 'today': case 'tomorrow': case 'day_after_tomorrow':
+        case 'weekday': case 'week': case 'next_week': case 'specific_date':
+          await handleSchedule(chatId, c.intent, c); break;
+        case 'delete': await handleDelete(chatId, c, text); break;
+        case 'update': await handleUpdate(chatId, c, text); break;
+        case 'delete_all': await handleBulk(chatId, c, 'delete'); break;
+        case 'move_all': await handleBulk(chatId, c, 'move'); break;
+        case 'set_timezone': await handleSetTz(chatId, text, c); break;
+        case 'get_timezone': await handleGetTz(chatId); break;
+        default: {
+          const answer = await classifier.freeAnswer(text);
+          await tg.send(chatId, R.rFree(answer));
+        }
+      }
+    } catch (e) {
+      console.error('router error:', e);
+      const chatId = u.message?.chat?.id || u.callback_query?.message?.chat?.id;
+      if (chatId) await tg.send(chatId, R.rFail()).catch(() => {});
+    }
+  }
+
+  return { handleUpdate: handleUpdateObj, refreshCache, calTz };
+}

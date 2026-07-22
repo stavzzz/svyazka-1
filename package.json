@@ -1,0 +1,14 @@
+{
+  "name": "secretary-bot",
+  "version": "1.0.0",
+  "description": "Связка 1 — личный ИИ-секретарь в Telegram (Google Calendar, Meet+Zoom). Модель только классифицирует, всё остальное — код.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "luxon": "^3.5.0"
+  }
+}

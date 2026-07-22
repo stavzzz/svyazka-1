@@ -1,0 +1,18 @@
+services:
+  secretary-bot:
+    build: .
+    container_name: secretary-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GOOGLE_CREDS_FILE: /creds/google.json
+      STATE_FILE: /data/state.json
+    volumes:
+      - ./data:/data
+      # Реюз кредов Google Workspace MCP (read-only)
+      - /root/.google_workspace_mcp/credentials/YOUR_EMAIL@gmail.com.json:/creds/google.json:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
