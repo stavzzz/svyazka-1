@@ -20,6 +20,9 @@ function eventBlock(v, { boldTime = true, withAttendees = false, withLocation = 
   const t = `${v.t1} – ${v.t2} ${v.zone}`;
   g1.push(`${v.clock} ${boldTime ? `<b>${t}</b>` : t}`);
   if (v.alt) g1.push(`${v.alt.clock} ${v.alt.t1} – ${v.alt.t2} ${v.alt.zone}`);
+  // Серия (24.07): подробное описание, если известно, иначе просто бейдж
+  if (v.recurDesc) g1.push(`🔁 ${esc(v.recurDesc)}`);
+  else if (v.recur) g1.push('🔁 повторяется');
   const g2 = [];
   if (withAttendees && v.attendees && v.attendees.length) g2.push(`👥 ${v.attendees.map(esc).join(', ')}`);
   if (withLocation && v.location) g2.push(`📍 ${esc(v.location)}`);
@@ -44,7 +47,7 @@ export function rCreated(v) {
 function scheduleLine(l) {
   let s = `${l.clock} <b>${l.t1} – ${l.t2} ${l.zone}</b>`;
   if (l.alt) s += ` ${l.alt.clock} ${l.alt.t1} – ${l.alt.t2} ${l.alt.zone}`;
-  s += ` • <a href="${esc(l.url)}">${esc(l.title)}</a>`;
+  s += ` • ${l.recur ? '🔁 ' : ''}<a href="${esc(l.url)}">${esc(l.title)}</a>`;
   return s;
 }
 
@@ -168,18 +171,20 @@ export function rTzCurrent(label, tz, gmt, nowHM) {
 
 // ── 6.13 Встреча удалена / удалены ───────────────────────────────
 // views: [eventView], notFound: ['X','Y']
-export function rDeleted(views, notFound = []) {
+export function rDeleted(views, notFound = [], scopeLabel = '') {
   const title = views.length > 1 ? '✅ Встречи удалены' : '✅ Встреча удалена';
   let out = head(title) + views.map((v) => eventBlock(v)).join('\n\n');
+  if (scopeLabel) out += `\n\n🔁 Объём: <b>${scopeLabel}</b>`;
   if (notFound.length) out += `\n\n📝 Не найдены: ${notFound.map(esc).join(', ')}`;
   return out;
 }
 
 // ── 6.14 Встреча перенесена / перенесены ─────────────────────────
-export function rMoved(views, notFound = []) {
+export function rMoved(views, notFound = [], scopeLabel = '') {
   const title = views.length > 1 ? '🔄 Встречи перенесены' : '🔄 Встреча перенесена';
   // Полная карточка (как у «создана»): встреча живая, ссылки актуальны.
   let out = head(title) + views.map((v) => eventBlock(v, { withAttendees: true, withLocation: true, withDescription: true, withLinks: true, withOpen: true })).join('\n\n');
+  if (scopeLabel) out += `\n\n🔁 Объём: <b>${scopeLabel}</b>`;
   if (notFound.length) out += `\n\n📝 Не найдены: ${notFound.map(esc).join(', ')}`;
   return out;
 }
@@ -193,9 +198,10 @@ export function rUpdated(v) {
 
 // Подтверждение удаления (защита от случайных удалений, правка Стаса).
 // more — сколько встреч не влезло в карточку (они тоже будут удалены).
-export function rConfirmDelete(views, notFound = [], more = 0) {
+export function rConfirmDelete(views, notFound = [], more = 0, scopeLabel = '') {
   const title = views.length > 1 || more ? '🗑 Удалить встречи?' : '🗑 Удалить встречу?';
   let out = head(title) + views.map((v) => eventBlock(v)).join('\n\n');
+  if (scopeLabel) out += `\n\n🔁 Объём: <b>${scopeLabel}</b>`;
   if (more > 0) out += `\n\n…и ещё ${more} — тоже будут удалены.`;
   if (notFound.length) out += `\n\n📝 Не найдены: ${notFound.map(esc).join(', ')}`;
   return out + '\n\nТочно удаляем?';
@@ -417,11 +423,92 @@ export function rWelcome() {
     '🔄 <b>Изменить:</b> «Перенеси Ивана на пятницу на 20:00», «Увеличь до двух часов», «Добавь описание и позови…»\n' +
     '❌ <b>Удалить:</b> «Удали Тест-1 и Тест-2» — спрошу подтверждение кнопками\n' +
     '🧹 <b>Массово:</b> «Удали все встречи сегодня», «Перенеси все встречи на неделю вперёд»\n' +
+    '🔁 <b>Серии:</b> «Йога каждый ПН и ПТ с 11:00 на 8 недель» — при удалении/переносе спрошу: только эту, эту и следующие или всю серию\n' +
     '🌍 <b>Таймзоны:</b> «Переключи зону на Москву» · «Какая у меня зона»\n\n' +
     '⚠️ Пересечения замечу сам и сразу предложу свободные окна дня.\n' +
     '🔍 Встреч с одним названием несколько — дам выбрать кнопкой-номером.\n' +
     '🔔 Напоминания (за сутки/час/30/10/5 мин), план дня и план недели — настрой кнопками в ⚙️ /reminders.\n\n' +
     '🎙 Говори голосом — я понимаю.';
+}
+
+// ── Повторяющиеся встречи (24.07) ────────────────────────────────
+
+// Карточка серии перед созданием: полная карточка + строка 🔁 (recurDesc в view).
+export function rConfirmRecur(v) {
+  return head('🔁 Повторяющаяся встреча') +
+    eventBlock(v, { withAttendees: true, withLocation: true, withDescription: true }) +
+    '\n\nСтавим серию?';
+}
+export function recurButtons(pendingKey) {
+  return [[
+    { text: '✅ Поставить', callback_data: `cal:add:${pendingKey}` },
+    { text: '❌ Отмена', callback_data: `cal:cancel:${pendingKey}` },
+  ]];
+}
+
+// Конфликты экземпляров серии (решение Стаса №3: три кнопки сразу).
+// conflicts: [{dayMonth:'ПН, 28 июля', title, t1, t2, zone}], more — не влезло в карточку.
+export function rRecurConflict(v, conflicts, more = 0) {
+  let out = head('⚠️ Конфликты в серии') + eventBlock(v) +
+    '\n\n⛔ Пересекаются:\n' +
+    conflicts.map((c) => `• ${c.dayMonth} — <b>${esc(c.title)}</b> ${c.t1}–${c.t2} ${c.zone}`).join('\n');
+  if (more > 0) out += `\n…и ещё ${more}`;
+  return out + '\n\nЧто делаем? «Пропустить эти дни» — серия встанет, конфликтные даты останутся пустыми.';
+}
+export function recurConflictButtons(pendingKey) {
+  return [[
+    { text: '✅ Всё равно', callback_data: `cal:add:${pendingKey}` },
+    { text: '⏭ Пропустить эти дни', callback_data: `cal:skipdays:${pendingKey}` },
+  ], [
+    { text: '❌ Отмена', callback_data: `cal:cancel:${pendingKey}` },
+  ]];
+}
+
+// Доспрос частоты (forceReply): «повторяющуюся встречу» без деталей.
+export function rAskRecurFreq(title) {
+  return head('🔁 Как часто повторять?') +
+    (title ? `📌 <b>${esc(title)}</b>\n` : '') +
+    'Ответь на это сообщение — например «каждый понедельник и пятницу», «по будням», «каждый день», «раз в 2 недели».';
+}
+export function rBadRecur() {
+  return head('⚠️ Не понял, как часто') +
+    'Скажи, например: «каждый вторник», «по будням», «каждый день» или «каждую вторую субботу».';
+}
+
+// Доспрос конца серии (решение Стаса №2: спрашиваем всегда, если не сказал).
+export function rAskRecurEnd(title) {
+  return head('📅 Докуда повторять?') +
+    (title ? `📌 <b>${esc(title)}</b>\n` : '') +
+    'Ответь на это сообщение — например «до конца августа», «на 8 недель», «10 раз» или «бессрочно».';
+}
+export function rBadRecurEnd() {
+  return head('⚠️ Не понял, докуда') +
+    'Скажи, например: «до конца августа», «до 15 сентября», «на 8 недель», «10 раз» или «бессрочно».';
+}
+
+// Вопрос объёма операции с серией (решение Стаса №1: все три варианта).
+// action: 'delete' | 'move'.
+export function rAskSeriesScope(action, v) {
+  const q = action === 'delete' ? 'Что удаляем?' : 'Что переносим?';
+  return head('🔁 Это повторяющаяся встреча') + eventBlock(v, { boldTime: false }) + `\n\n${q}`;
+}
+export function seriesScopeButtons(pendingKey, dateLabel) {
+  return [
+    [{ text: `Только эту (${dateLabel})`, callback_data: `cal:scope:${pendingKey}:one` }],
+    [{ text: 'Эту и все следующие', callback_data: `cal:scope:${pendingKey}:fol` }],
+    [{ text: 'Всю серию', callback_data: `cal:scope:${pendingKey}:all` }],
+    [{ text: '❌ Отмена', callback_data: `cal:scope:${pendingKey}:x` }],
+  ];
+}
+
+// Пометка объёма в подтверждении удаления серии.
+export const SCOPE_LABELS = { one: 'только это занятие', fol: 'это занятие и все следующие', all: 'вся серия' };
+
+// Для всей серии бот меняет только время — дни серии меняются пересозданием.
+export function rSeriesMoveHint() {
+  return head('🤔 Для всей серии меняю только время') +
+    'Скажи, например: «перенеси всю йогу на 12:00» или «сдвинь всю серию на час позже».\n' +
+    'Поменять дни недели — удали серию и поставь заново: «йога каждый ВТ и ЧТ в 11».';
 }
 
 // Детерминированная заглушка при внутренней ошибке (не молчать — урок дефекта №3).

@@ -34,6 +34,9 @@ export function normEvent(raw) {
       .map((a) => [a.email, a.responseStatus || 'needsAction'])),
     meet: meetLink(raw),
     zoom: (raw.description || '').match(ZOOM_RX)?.[1] || '',
+    // Серии (24.07): у экземпляра — recurringEventId, у мастера — recurrence
+    recurringEventId: raw.recurringEventId || null,
+    recurrence: raw.recurrence || null,
   };
 }
 
@@ -86,11 +89,15 @@ export function viewFromEvent(ev, calTz) {
     description: stripZoomLine(ev.description),
     links: buildLinks(ev.meet, ev.zoom),
     htmlLink: ev.htmlLink,
+    recur: Boolean(ev.recurringEventId || ev.recurrence), // 🔁-бейдж
   };
 }
 
 // Строка расписания.
 export function lineFromEvent(ev, calTz) {
   const t = timesFor(ev, calTz);
-  return { clock: t.clock, t1: t.t1, t2: t.t2, zone: t.zone, alt: t.alt, url: ev.htmlLink, title: ev.summary };
+  return {
+    clock: t.clock, t1: t.t1, t2: t.t2, zone: t.zone, alt: t.alt, url: ev.htmlLink, title: ev.summary,
+    recur: Boolean(ev.recurringEventId || ev.recurrence),
+  };
 }

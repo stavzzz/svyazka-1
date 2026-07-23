@@ -94,11 +94,11 @@ test('6.4 конфликт + кнопки с протоколом cal:<action>:<
     '📌 <b>Тест</b>\n🗓 13 июля 2026\n🕙 <b>10:00 – 11:00 МСК</b>\n\n' +
     '⛔ Пересекается с:\n• <b>Планёрка</b> 10:30–11:30 МСК\n• <b>Ещё встреча</b> 10:00–10:45 МСК\n\n' +
     'Что делаем?');
-  const btns = R.conflictButtons('111111111_a1B2c3D4');
+  const btns = R.conflictButtons('83494179_a1B2c3D4');
   assert.deepEqual(btns, [[
-    { text: '✅ Всё равно', callback_data: 'cal:add:111111111_a1B2c3D4' },
-    { text: '🔁 Перенести', callback_data: 'cal:reschedule:111111111_a1B2c3D4' },
-    { text: '❌ Отмена', callback_data: 'cal:cancel:111111111_a1B2c3D4' },
+    { text: '✅ Всё равно', callback_data: 'cal:add:83494179_a1B2c3D4' },
+    { text: '🔁 Перенести', callback_data: 'cal:reschedule:83494179_a1B2c3D4' },
+    { text: '❌ Отмена', callback_data: 'cal:cancel:83494179_a1B2c3D4' },
   ]]);
   for (const b of btns[0]) assert.ok(Buffer.byteLength(b.callback_data) <= 64);
 });

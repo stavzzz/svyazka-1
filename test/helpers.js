@@ -6,7 +6,7 @@ import { DateTime } from 'luxon';
 import { createState } from '../src/state.js';
 
 export const NOW = DateTime.fromISO('2026-07-22T12:00:00', { zone: 'Europe/Moscow' }).toMillis();
-export const OWNER = 111111111;
+export const OWNER = 83494179;
 
 // Telegram-мок: копит отправки, выдаёт message_id.
 export function mockTg() {
@@ -46,10 +46,17 @@ export function mockGcal({ tz = 'Europe/Moscow', events = [] } = {}) {
     async listEvents(minISO, maxISO) {
       const a = DateTime.fromISO(minISO).toMillis();
       const b = DateTime.fromISO(maxISO).toMillis();
+      // Как Google с singleEvents=true: мастера серий (с recurrence) в списках нет
       return store.filter((e) => {
+        if (e.recurrence) return false;
         const s = DateTime.fromISO(e.start.dateTime || e.start.date).toMillis();
         return s >= a && s < b;
       });
+    },
+    async getEvent(id) {
+      const raw = store.find((e) => e.id === id);
+      if (!raw) throw new Error('404');
+      return raw;
     },
     async createEvent(ev, opts = {}) {
       const id = `ev${++idc}`;
@@ -63,10 +70,13 @@ export function mockGcal({ tz = 'Europe/Moscow', events = [] } = {}) {
         attendees: (ev.attendees || []).map((e) => ({ email: e })),
         location: ev.location || undefined,
         description: ev.description || undefined,
+        recurrence: ev.recurrence || undefined,
         hangoutLink: opts.meet === false ? undefined : `https://meet.google.com/${id}`,
       };
       store.push(raw);
       api.calls.push(['create', raw]);
+      // Серия: как Google — разворачиваем экземпляры в список (первые 10 достаточно)
+      if (raw.recurrence) expandMockSeries(store, raw);
       return raw;
     },
     async patchEvent(id, patch) {
@@ -77,6 +87,7 @@ export function mockGcal({ tz = 'Europe/Moscow', events = [] } = {}) {
       if (patch.end) raw.end = { dateTime: patch.end.dateTime, timeZone: patch.end.timeZone };
       if (patch.attendees) raw.attendees = patch.attendees;
       if (patch.description !== undefined) raw.description = patch.description;
+      if (patch.recurrence) raw.recurrence = patch.recurrence;
       api.calls.push(['patch', id, patch]);
       return raw;
     },
@@ -150,4 +161,44 @@ export function rawEvent(id, summary, startISO, endISO, { tz = 'Europe/Moscow', 
     htmlLink: `https://cal/${id}`,
     description,
   };
+}
+
+// Экземпляр серии (как отдаёт singleEvents=true): id мастера + recurringEventId.
+export function rawRecurInstance(masterId, summary, startISO, endISO, { tz = 'Europe/Moscow' } = {}) {
+  const stamp = DateTime.fromISO(startISO, { zone: tz }).toUTC().toFormat("yyyyMMdd'T'HHmmss'Z'");
+  return { ...rawEvent(`${masterId}_${stamp}`, summary, startISO, endISO, { tz }), recurringEventId: masterId };
+}
+
+// Мастер серии (в списках не появляется — только через getEvent).
+export function rawRecurMaster(id, summary, startISO, endISO, recurrence, { tz = 'Europe/Moscow', attendees = [] } = {}) {
+  return { ...rawEvent(id, summary, startISO, endISO, { tz }), recurrence, attendees: attendees.map((e) => ({ email: e })) };
+}
+
+// Разворот серии в моке (упрощённо: weekly по BYDAY / daily, до 10 экземпляров).
+function expandMockSeries(store, master) {
+  const tz = master.start.timeZone || 'Europe/Moscow';
+  const rrule = (master.recurrence || []).find((s) => s.startsWith('RRULE')) || '';
+  const exdate = (master.recurrence || []).find((s) => s.startsWith('EXDATE')) || '';
+  const excluded = new Set((exdate.split(':')[1] || '').split(',').filter(Boolean));
+  const s0 = DateTime.fromISO(master.start.dateTime, { zone: tz });
+  const e0 = DateTime.fromISO(master.end.dateTime, { zone: tz });
+  const durMs = e0.toMillis() - s0.toMillis();
+  const byday = (/BYDAY=([^;]+)/.exec(rrule)?.[1] || '').split(',').filter(Boolean);
+  const codes = { MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6, SU: 7 };
+  const wanted = new Set(byday.map((c) => codes[c]).filter(Boolean));
+  const count = parseInt(/COUNT=(\d+)/.exec(rrule)?.[1], 10) || 10;
+  let made = 0;
+  for (let d = s0; made < Math.min(count, 10); d = d.plus({ days: 1 })) {
+    if (wanted.size && !wanted.has(d.weekday)) continue;
+    if (excluded.has(d.toFormat("yyyyMMdd'T'HHmmss"))) { continue; }
+    store.push({
+      ...master,
+      id: `${master.id}_${d.toUTC().toFormat("yyyyMMdd'T'HHmmss'Z'")}`,
+      recurrence: undefined,
+      recurringEventId: master.id,
+      start: { dateTime: d.toISO(), timeZone: tz },
+      end: { dateTime: DateTime.fromMillis(d.toMillis() + durMs, { zone: tz }).toISO(), timeZone: tz },
+    });
+    made++;
+  }
 }

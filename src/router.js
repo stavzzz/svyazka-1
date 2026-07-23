@@ -10,6 +10,10 @@ import { parseWhen } from './timeparse.js';
 import { newPendingKey } from './state.js';
 import { normEvent, viewFromEvent, lineFromEvent, timesFor, buildLinks } from './views.js';
 import { freeSlots, fmtDur } from './slots.js';
+import {
+  normRecur, buildRecurrence, withExdates, parseRecurPhrase, parseRecurEnd,
+  describeRecur, expandOccurrences, nextByday, recurFromRRule,
+} from './recur.js';
 
 const WD_RU = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'];
 
@@ -247,6 +251,18 @@ export function createRouter(deps) {
   }
   function exactKey(s) { return wordsAll(s).filter((w) => !STOP_WORDS.has(w)).join(' '); }
 
+  // Серия в кэше — это десятки экземпляров с одним recurringEventId (24.07):
+  // в поиске оставляем один, ближайший (иначе «удали йогу» выдаст 16 кнопок).
+  function collapseSeries(list) {
+    const seen = new Set();
+    return [...list].sort((a, b) => a.startMs - b.startMs).filter((e) => {
+      const k = e.recurringEventId || e.id;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }
+
   function searchByTitle(title) {
     const q = (title || '').trim();
     if (!q) return [];
@@ -256,9 +272,9 @@ export function createRouter(deps) {
     const k = exactKey(q);
     if (k) {
       const exact = base.filter((e) => exactKey(e.summary) === k);
-      if (exact.length) return exact;
+      if (exact.length) return collapseSeries(exact);
     }
-    return base.filter((e) => titleMatches(q, e.summary));
+    return collapseSeries(base.filter((e) => titleMatches(q, e.summary)));
   }
 
   // Фолбэк: классификатор не вытащил название (запятые, обороты) —
@@ -267,13 +283,13 @@ export function createRouter(deps) {
     const t = (text || '').trim();
     if (!t) return [];
     const seen = new Set();
-    return state.data.cache.events.filter((e) => {
+    return collapseSeries(state.data.cache.events.filter((e) => {
       if (e.status === 'cancelled' || e.endMs <= now() - 3600_000) return false;
       if (!titleMatches(e.summary, t)) return false; // все слова названия есть в тексте
       if (seen.has(e.id)) return false;
       seen.add(e.id);
       return true;
-    });
+    }));
   }
 
   // ── Обработчики интентов ─────────────────────────────────────
@@ -307,8 +323,17 @@ export function createRouter(deps) {
     state.save();
   }
 
-  // Нет времени → спросить время (forceReply), есть → к конфликт-гейту.
+  // Цепочка доспроса при создании: частота серии → время → конец серии →
+  // карточка серии / конфликт-гейт. Каждый шаг — отдельный pending.
   async function askTimeOrCreate(chatId, ev) {
+    // Серия без частоты («поставь повторяющуюся встречу Йога») → «Как часто?»
+    if (ev.recur && !ev.recur.freq) {
+      const key = newPendingKey(chatId);
+      const msg = await tg.send(chatId, R.rAskRecurFreq(ev.title), { forceReply: true });
+      state.data.pending[chatId] = { key, kind: 'await_recur_freq', action: 'create', ev, createdAt: now(), promptMsgId: msg.message_id };
+      state.save();
+      return;
+    }
     if (!ev.time) {
       const key = newPendingKey(chatId);
       const msg = await tg.send(chatId, R.rAskTime(ev.title, zoneLabel(calTz(), now())), { forceReply: true });
@@ -316,7 +341,105 @@ export function createRouter(deps) {
       state.save();
       return;
     }
+    // Конец серии не назван → «Докуда повторять?» (решение Стаса №2)
+    if (ev.recur && !ev.recur.count && !ev.recur.untilISO && !ev.recur.endless) {
+      const key = newPendingKey(chatId);
+      const msg = await tg.send(chatId, R.rAskRecurEnd(ev.title), { forceReply: true });
+      state.data.pending[chatId] = { key, kind: 'await_recur_end', action: 'create', ev, createdAt: now(), promptMsgId: msg.message_id };
+      state.save();
+      return;
+    }
+    if (ev.recur) { await confirmRecurCard(chatId, ev); return; }
     await resolveAndMaybeCreate(chatId, ev);
+  }
+
+  // ── Серии (24.07): первая встреча, карточка, конфликт-гейт, создание ──
+
+  // Дата пользователя может не попадать в byday («каждый ПН», сказано в среду) —
+  // двигаем старт до ближайшего подходящего дня.
+  function firstStartOf(ev) {
+    const start = DateTime.fromISO(`${ev.date}T${ev.time}`, { zone: ev.tz });
+    return ev.recur ? nextByday(start, ev.recur.byday) : start;
+  }
+
+  function recurDescOf(ev) {
+    const first = firstStartOf(ev);
+    const occ = ev.recur.untilISO ? expandOccurrences(ev.recur, first) : [];
+    return describeRecur(ev.recur, first, occ.length);
+  }
+
+  // Карточка серии с подтверждением (перед конфликт-гейтом).
+  async function confirmRecurCard(chatId, evIn) {
+    const first = firstStartOf(evIn);
+    const ev = { ...evIn, date: first.toISODate() };
+    const desc = recurDescOf(ev);
+    const { view } = pendingView(ev);
+    view.recurDesc = desc;
+    const key = newPendingKey(chatId);
+    const html = R.rConfirmRecur(view);
+    const sent = await tg.send(chatId, html, { buttons: R.recurButtons(key) });
+    state.data.pending[chatId] = { key, kind: 'confirm', action: 'create_recur', ev, recurDesc: desc, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+    state.save();
+  }
+
+  // Конфликт-гейт серии: разворачиваем экземпляры и проверяем каждый по кэшу.
+  async function recurGateOrCreate(chatId, ev, desc) {
+    const first = firstStartOf(ev);
+    const durMs = ev.durationMin * 60_000;
+    const busy = state.data.cache.events.filter((e) => !e.allDay && !e.transparent);
+    const occ = expandOccurrences(ev.recur, first);
+    const bad = occ.filter((o) => findConflicts(o.toMillis(), o.toMillis() + durMs, busy).length);
+    if (!bad.length) { await doCreateRecur(chatId, ev, desc, []); return; }
+    const items = bad.slice(0, 5).map((o) => {
+      const c0 = findConflicts(o.toMillis(), o.toMillis() + durMs, busy)[0];
+      const t = timesFor(c0, calTz());
+      return { dayMonth: fmtDayShort(o.setZone(calTz())), title: c0.summary, t1: t.t1, t2: t.t2, zone: t.zone };
+    });
+    const { view } = pendingView({ ...ev, date: first.toISODate() });
+    view.recurDesc = desc;
+    const key = newPendingKey(chatId);
+    const html = R.rRecurConflict(view, items, Math.max(0, bad.length - 5));
+    const sent = await tg.send(chatId, html, { buttons: R.recurConflictButtons(key) });
+    state.data.pending[chatId] = {
+      key, kind: 'confirm', action: 'create_recur_conflict', ev, recurDesc: desc,
+      exdates: bad.map((o) => o.toISO()), createdAt: now(), cardHtml: html, promptMsgId: sent.message_id,
+    };
+    state.save();
+  }
+
+  // Создание серии: RRULE (+EXDATE при «Пропустить эти дни»), Meet на серию,
+  // Zoom один на серию (ссылка в описании — как у обычной встречи).
+  async function doCreateRecur(chatId, ev, desc, exdateISOs) {
+    const start = firstStartOf(ev);
+    const end = start.plus({ minutes: ev.durationMin });
+    let zoomUrl = '';
+    if (zoom.enabled) {
+      try {
+        const z = await zoom.createMeeting(ev.title, start.toFormat("yyyy-MM-dd'T'HH:mm:ss"), ev.durationMin, ev.tz);
+        zoomUrl = z.joinUrl;
+      } catch (e) { console.error('zoom create failed:', e.message); }
+    }
+    let description = ev.description || '';
+    if (zoomUrl) description = (description ? description + '\n\n' : '') + `Zoom: ${zoomUrl}`;
+    const rules = ev.recur.endless ? { ...ev.recur, count: 0, untilISO: '' } : ev.recur;
+    const recurrence = withExdates(buildRecurrence(rules, start),
+      exdateISOs.map((s) => DateTime.fromISO(s, { zone: ev.tz })));
+    const raw = await gcal.createEvent({
+      summary: ev.title,
+      startISO: start.toISO(),
+      endISO: end.toISO(),
+      tz: ev.tz,
+      attendees: ev.attendees,
+      location: ev.location,
+      description,
+      recurrence,
+    }, { meet: true });
+    await refreshCache();
+    const nev = normEvent(raw);
+    if (!nev.tz) nev.tz = ev.tz;
+    const view = viewFromEvent(nev, calTz());
+    view.recurDesc = desc;
+    await tg.send(chatId, R.rCreated(view));
   }
 
   async function handleCreate(chatId, c, text) {
@@ -330,7 +453,20 @@ export function createRouter(deps) {
       attendees: c.attendees || [],
       location: c.location || '',
       description: c.description || '',
+      recur: normRecur(c.recur) || undefined,
     };
+    // Детерминированная страховка (24.07): классификатор мог упустить или
+    // недозаполнить recur — сверяем с текстом фразы.
+    if (!ev.recur || !ev.recur.freq) {
+      const p = parseRecurPhrase(text);
+      if (p) ev.recur = { count: 0, untilISO: '', ...(ev.recur || {}), ...p };
+    }
+    if (ev.recur?.freq && !ev.recur.count && !ev.recur.untilISO) {
+      const e = parseRecurEnd(text, DateTime.fromISO(`${ev.date}T${ev.time || '12:00'}`, { zone: ev.tz }));
+      if (e?.none) ev.recur.endless = true;
+      else if (e?.count) ev.recur.count = e.count;
+      else if (e?.untilISO) ev.recur.untilISO = e.untilISO;
+    }
     const ampm = Boolean(ev.time) && ampmAmbiguous(text, ev.time);
     // Правка 23.07: без названия НЕ создаём «Встречу» — спрашиваем название.
     if (!ev.title) {
@@ -470,6 +606,20 @@ export function createRouter(deps) {
     const notFound = r.notFound;
     if (!found.length) { await tg.send(chatId, R.rNotFound(titles.length ? titles : ['(без названия)'])); return; }
 
+    // Экземпляр серии (24.07): выясняем объём. Конкретная дата/время во фразе —
+    // значит, речь про одно занятие; «удали серию» — классификатор дал series_scope.
+    if (found.length === 1 && found[0].recurringEventId) {
+      let target = found[0];
+      // Поиск схлопнул серию до ближайшего экземпляра — а фраза могла называть
+      // конкретный день: берём экземпляр этой даты.
+      if (c.date) target = seriesInstanceOn(target, c.date) || target;
+      const scope = { one: 'one', following: 'fol', all: 'all' }[c.series_scope]
+        || ((c.date || c.time_start) ? 'one' : '');
+      if (!scope) { await askSeriesScope(chatId, target, 'delete', c); return; }
+      await confirmSeriesDelete(chatId, target, scope);
+      return;
+    }
+
     // Защита от случайного удаления: подтверждение кнопками
     const key = newPendingKey(chatId);
     const html = R.rConfirmDelete(found.map((e) => viewFromEvent(e, calTz())), notFound);
@@ -522,7 +672,17 @@ export function createRouter(deps) {
 
   // Карточка найденной встречи с кнопками действий (тест 46)
   async function sendFoundCard(chatId, event) {
-    const html = R.rFound([viewFromEvent(event, calTz())]);
+    const view = viewFromEvent(event, calTz());
+    // Экземпляр серии: подтянуть ритм с мастера («еженедельно по ПН и ПТ · …»)
+    if (event.recurringEventId) {
+      try {
+        const master = await gcal.getEvent(event.recurringEventId);
+        const rrule = (master.recurrence || []).find((x) => x.startsWith('RRULE'));
+        const rec = rrule ? recurFromRRule(rrule, event.tz || calTz()) : null;
+        if (rec) view.recurDesc = describeRecur(rec, DateTime.fromMillis(event.startMs, { zone: event.tz || calTz() }), 0);
+      } catch { /* бейджа 🔁 достаточно */ }
+    }
+    const html = R.rFound([view]);
     const key = newPendingKey(chatId);
     const sent = await tg.send(chatId, html, { buttons: R.foundButtons(key) });
     state.data.pending[chatId] = { key, kind: 'found', event, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
@@ -584,6 +744,24 @@ export function createRouter(deps) {
   }
 
   async function doDelete(chatId, pending) {
+    // Серия (24.07): объём выбран кнопками — удаляем экземпляр/хвост/мастер.
+    if (pending.seriesScope && pending.events[0]?.recurringEventId) {
+      const target = pending.events[0];
+      try {
+        if (pending.seriesScope === 'all') await gcal.deleteEvent(target.recurringEventId);
+        else if (pending.seriesScope === 'fol') {
+          await truncateSeriesBefore(target.recurringEventId,
+            DateTime.fromMillis(target.startMs, { zone: target.tz || calTz() }));
+        } else await gcal.deleteEvent(target.id);
+      } catch (e) {
+        console.error('series delete failed:', e.message);
+        await tg.send(chatId, R.rCalError());
+        return;
+      }
+      await refreshCache();
+      await tg.send(chatId, R.rDeleted([viewFromEvent(target, calTz())], [], R.SCOPE_LABELS[pending.seriesScope]));
+      return;
+    }
     for (const ev of pending.events) {
       try { await gcal.deleteEvent(ev.id); } catch (e) {
         console.error('delete failed:', e.message);
@@ -593,6 +771,154 @@ export function createRouter(deps) {
     }
     await refreshCache();
     await tg.send(chatId, R.rDeleted(pending.events.map((e) => viewFromEvent(e, calTz())), pending.notFound));
+  }
+
+  // ── Операции с серией: объём, усечение, переносы (24.07) ─────────
+
+  // Экземпляр серии на конкретную дату (фраза «…в понедельник») — из кэша.
+  function seriesInstanceOn(target, dateISO) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateISO || '')) return null;
+    return state.data.cache.events.find((e) =>
+      e.recurringEventId === target.recurringEventId && e.status !== 'cancelled' &&
+      DateTime.fromMillis(e.startMs, { zone: calTz() }).toISODate() === dateISO) || null;
+  }
+
+  // Вопрос «только эту / эту и следующие / всю серию» кнопками.
+  async function askSeriesScope(chatId, target, action, c) {
+    const key = newPendingKey(chatId);
+    const html = R.rAskSeriesScope(action, viewFromEvent(target, calTz()));
+    const dateLabel = fmtDayShort(DateTime.fromMillis(target.startMs, { zone: calTz() }));
+    const sent = await tg.send(chatId, html, { buttons: R.seriesScopeButtons(key, dateLabel) });
+    state.data.pending[chatId] = { key, kind: 'series_scope', action, target, c, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+    state.save();
+  }
+
+  // Подтверждение удаления с пометкой объёма (стандартные Да/Нет).
+  async function confirmSeriesDelete(chatId, target, scope) {
+    const key = newPendingKey(chatId);
+    const html = R.rConfirmDelete([viewFromEvent(target, calTz())], [], 0, R.SCOPE_LABELS[scope]);
+    const sent = await tg.send(chatId, html, { buttons: R.deleteButtons(key) });
+    state.data.pending[chatId] = {
+      key, kind: 'confirm', action: 'delete', events: [target], notFound: [],
+      seriesScope: scope, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id,
+    };
+    state.save();
+  }
+
+  // «Эту и следующие»: у мастера правится RRULE — UNTIL за секунду до экземпляра.
+  async function truncateSeriesBefore(masterId, instanceStart) {
+    const master = await gcal.getEvent(masterId);
+    const rec = master.recurrence || [];
+    const rrule = rec.find((s) => s.startsWith('RRULE'));
+    if (!rrule) throw new Error('no RRULE on master');
+    const cleaned = rrule.replace(/;?(UNTIL|COUNT)=[^;]*/g, '');
+    const until = instanceStart.minus({ seconds: 1 }).toUTC().toFormat("yyyyMMdd'T'HHmmss'Z'");
+    const recurrence = [`${cleaned};UNTIL=${until}`, ...rec.filter((s) => !s.startsWith('RRULE'))];
+    await gcal.patchEvent(masterId, { recurrence });
+    return master;
+  }
+
+  // Перенос после выбора объёма. c: {time_start?, date?, shift_min?, duration_min?}
+  async function continueSeriesMove(chatId, target, c, scope) {
+    const shiftMin = parseInt(c.shift_min, 10) || 0;
+    if (scope === 'one') {
+      if (c.time_start || c.date || shiftMin) {
+        await applyUpdate(chatId, target, c, { scopeResolved: true });
+        return;
+      }
+      // нечего применять — спросить новое время, дальше обычный перенос экземпляра
+      const tz = target.tz || calTz();
+      const s = DateTime.fromMillis(target.startMs, { zone: tz });
+      const ev = { title: target.summary, date: s.toISODate(), time: s.toFormat('HH:mm'), tz, durationMin: Math.round((target.endMs - target.startMs) / 60000) };
+      const msg2 = await tg.send(chatId, R.rAskNewTime(zoneLabel(calTz(), now())), { forceReply: true });
+      state.data.pending[chatId] = { kind: 'await_reschedule', action: 'move', ev, eventId: target.id, createdAt: now(), promptMsgId: msg2.message_id };
+      state.save();
+      return;
+    }
+    if (!c.time_start && !shiftMin) {
+      // Вся серия / хвост двигаются только по времени; «на среду» — пересоздание.
+      if (c.date) { await tg.send(chatId, R.rSeriesMoveHint()); return; }
+      const tz = target.tz || calTz();
+      const s = DateTime.fromMillis(target.startMs, { zone: tz });
+      const ev = { title: target.summary, date: s.toISODate(), time: s.toFormat('HH:mm'), tz, durationMin: Math.round((target.endMs - target.startMs) / 60000) };
+      const msg2 = await tg.send(chatId, R.rAskNewTime(zoneLabel(calTz(), now())), { forceReply: true });
+      state.data.pending[chatId] = { kind: 'await_reschedule', action: 'move', seriesScope: scope, seriesTarget: target, ev, eventId: target.id, createdAt: now(), promptMsgId: msg2.message_id };
+      state.save();
+      return;
+    }
+    if (scope === 'all') await doMoveSeriesAll(chatId, target, c);
+    else await doMoveSeriesFollowing(chatId, target, c);
+  }
+
+  // «Всю серию»: патч мастера — новое время дня (или сдвиг), ритм не трогаем.
+  async function doMoveSeriesAll(chatId, target, c) {
+    try {
+      const masterId = target.recurringEventId;
+      const master = await gcal.getEvent(masterId);
+      const tz = master.start?.timeZone || target.tz || calTz();
+      let s = DateTime.fromISO(master.start.dateTime, { zone: tz });
+      const e0 = DateTime.fromISO(master.end.dateTime, { zone: tz });
+      const durMin = parseInt(c.duration_min, 10) > 0
+        ? parseInt(c.duration_min, 10)
+        : Math.round(e0.diff(s, 'minutes').minutes);
+      const shiftMin = parseInt(c.shift_min, 10) || 0;
+      if (shiftMin) s = s.plus({ minutes: shiftMin });
+      else if (/^\d{2}:\d{2}$/.test(c.time_start || '')) {
+        s = s.set({ hour: +c.time_start.slice(0, 2), minute: +c.time_start.slice(3) });
+      } else { await tg.send(chatId, R.rSeriesMoveHint()); return; }
+      const raw = await gcal.patchEvent(masterId, {
+        start: { dateTime: s.toISO(), timeZone: tz },
+        end: { dateTime: s.plus({ minutes: durMin }).toISO(), timeZone: tz },
+      });
+      await refreshCache();
+      await tg.send(chatId, R.rMoved([viewFromEvent(normEvent(raw), calTz())], [], R.SCOPE_LABELS.all));
+    } catch (err) {
+      console.error('series move all failed:', err.message);
+      await tg.send(chatId, R.rCalError());
+    }
+  }
+
+  // «Эту и следующие»: усечь старую серию + новая серия с этой даты в новое
+  // время, тот же ритм; COUNT пересчитывается на остаток.
+  async function doMoveSeriesFollowing(chatId, target, c) {
+    try {
+      const masterId = target.recurringEventId;
+      const tz = target.tz || calTz();
+      const instStart = DateTime.fromMillis(target.startMs, { zone: tz });
+      const master = await gcal.getEvent(masterId);
+      // RRULE снять ДО усечения — patch перепишет recurrence мастера
+      const rrule = (master.recurrence || []).find((x) => x.startsWith('RRULE')) || 'RRULE:FREQ=WEEKLY';
+      await truncateSeriesBefore(masterId, instStart);
+      const recObj = recurFromRRule(rrule, tz) || { freq: 'weekly', byday: [], interval: 1, count: 0, untilISO: '' };
+      if (recObj.count > 0) {
+        const masterStart = DateTime.fromISO(master.start.dateTime, { zone: tz });
+        const done = expandOccurrences({ ...recObj, count: 0, untilISO: '' }, masterStart, { horizonDays: 400, cap: recObj.count })
+          .filter((d) => d < instStart).length;
+        recObj.count = Math.max(1, recObj.count - done);
+      }
+      const durMin = Math.round((target.endMs - target.startMs) / 60000);
+      const shiftMin = parseInt(c.shift_min, 10) || 0;
+      let s = instStart;
+      if (shiftMin) s = s.plus({ minutes: shiftMin });
+      else if (/^\d{2}:\d{2}$/.test(c.time_start || '')) {
+        s = s.set({ hour: +c.time_start.slice(0, 2), minute: +c.time_start.slice(3) });
+      } else { await tg.send(chatId, R.rSeriesMoveHint()); return; }
+      const raw = await gcal.createEvent({
+        summary: master.summary,
+        startISO: s.toISO(),
+        endISO: s.plus({ minutes: durMin }).toISO(),
+        tz,
+        attendees: (master.attendees || []).filter((a) => !a.self && !a.resource).map((a) => a.email),
+        location: master.location || '',
+        description: master.description || '',
+        recurrence: buildRecurrence(recObj, s),
+      }, { meet: true });
+      await refreshCache();
+      await tg.send(chatId, R.rMoved([viewFromEvent(normEvent(raw), calTz())], [], R.SCOPE_LABELS.fol));
+    } catch (err) {
+      console.error('series move following failed:', err.message);
+      await tg.send(chatId, R.rCalError());
+    }
   }
 
   // Несколько названных встреч одной фразой: «перенеси X и Y на завтра».
@@ -670,8 +996,37 @@ export function createRouter(deps) {
     await applyUpdate(chatId, matches[0], c);
   }
 
-  async function applyUpdate(chatId, target, c) {
+  async function applyUpdate(chatId, target, c, { scopeResolved = false } = {}) {
     const newTitle = (c.new_title || '').trim(); // переименование (правка 23.07 вечер)
+
+    // Экземпляр серии (24.07): смена времени → сначала объём операции.
+    if (!scopeResolved && target.recurringEventId) {
+      let t = target;
+      let dateSelector = false; // дата во фразе называет экземпляр, а не назначение
+      if (c.date) {
+        const sib = seriesInstanceOn(target, c.date);
+        if (sib) { t = sib; dateSelector = true; }
+      }
+      const tDate = DateTime.fromMillis(t.startMs, { zone: t.tz || calTz() }).toISODate();
+      const shiftMin0 = parseInt(c.shift_min, 10) || 0;
+      const wantsTime = Boolean(c.time_start) || shiftMin0 !== 0 ||
+        (Boolean(c.date) && !dateSelector && c.date !== tDate);
+      if (wantsTime) {
+        const scope = { one: 'one', following: 'fol', all: 'all' }[c.series_scope]
+          || ((dateSelector && c.time_start) ? 'one' : '');
+        if (!scope) { await askSeriesScope(chatId, t, 'move', c); return; }
+        await continueSeriesMove(chatId, t, { ...c, date: dateSelector ? '' : c.date }, scope);
+        return;
+      }
+      // «перенеси йогу в понедельник» без нового времени — перенос этого занятия
+      if (dateSelector && !newTitle && !(parseInt(c.duration_min, 10) > 0)
+        && !(c.attendees_add?.length) && !c.description) {
+        await continueSeriesMove(chatId, t, {}, 'one');
+        return;
+      }
+      target = t; // переименование/участники/описание — patch мастера ниже
+    }
+
     const tz0 = target.tz || calTz();
     const oldStart0 = DateTime.fromMillis(target.startMs, { zone: tz0 });
 
@@ -708,24 +1063,31 @@ export function createRouter(deps) {
       return;
     }
 
-    // Изменения без переноса: новое название / длительность / участники / описание
+    // Изменения без переноса: новое название / длительность / участники / описание.
+    // Для экземпляра серии правим МАСТЕР — «переименуй йогу» = вся серия (24.07).
+    let patchTarget = target;
+    let patchId = target.id;
+    if (target.recurringEventId) {
+      patchId = target.recurringEventId;
+      try { patchTarget = normEvent(await gcal.getEvent(patchId)); } catch { patchId = target.id; patchTarget = target; }
+    }
     const patch = {};
     if (newTitle) patch.summary = newTitle;
     if (parseInt(c.duration_min, 10) > 0) {
-      const end = DateTime.fromMillis(target.startMs).plus({ minutes: parseInt(c.duration_min, 10) });
-      patch.end = { dateTime: end.toISO(), timeZone: target.tz || calTz() };
+      const end = DateTime.fromMillis(patchTarget.startMs).plus({ minutes: parseInt(c.duration_min, 10) });
+      patch.end = { dateTime: end.toISO(), timeZone: patchTarget.tz || calTz() };
     }
     if (c.attendees_add?.length) {
-      const emails = new Set([...target.attendees, ...c.attendees_add]);
+      const emails = new Set([...patchTarget.attendees, ...c.attendees_add]);
       patch.attendees = [...emails].map((e) => ({ email: e }));
     }
     if (c.description) {
-      const zoomUrl = target.zoom;
+      const zoomUrl = patchTarget.zoom;
       patch.description = c.description + (zoomUrl ? `\n\nZoom: ${zoomUrl}` : '');
     }
     if (!Object.keys(patch).length) { await tg.send(chatId, R.rFail()); return; }
     try {
-      const raw = await gcal.patchEvent(target.id, patch);
+      const raw = await gcal.patchEvent(patchId, patch);
       await refreshCache();
       await tg.send(chatId, R.rUpdated(viewFromEvent(normEvent(raw), calTz())));
     } catch (e) {
@@ -914,6 +1276,8 @@ export function createRouter(deps) {
       state.save();
       if (fnd[1] === 'fdel') {
         await stripButtons(chatId, pending, '🗑 Удалить');
+        // Экземпляр серии → сначала объём (решение Стаса №1)
+        if (e.recurringEventId) { await askSeriesScope(chatId, e, 'delete', {}); return; }
         const key = newPendingKey(chatId);
         const html = R.rConfirmDelete([viewFromEvent(e, calTz())]);
         const sent = await tg.send(chatId, html, { buttons: R.deleteButtons(key) });
@@ -923,6 +1287,7 @@ export function createRouter(deps) {
       }
       if (fnd[1] === 'fmove') {
         await stripButtons(chatId, pending, '🔁 Перенести');
+        if (e.recurringEventId) { await askSeriesScope(chatId, e, 'move', {}); return; }
         const tz = e.tz || calTz();
         const s = DateTime.fromMillis(e.startMs, { zone: tz });
         const ev = { title: e.summary, date: s.toISODate(), time: s.toFormat('HH:mm'), tz, durationMin: Math.round((e.endMs - e.startMs) / 60000) };
@@ -936,6 +1301,43 @@ export function createRouter(deps) {
       const msg2 = await tg.send(chatId, isRen ? R.rAskRename() : R.rAskInvite(), { forceReply: true });
       state.data.pending[chatId] = { kind: isRen ? 'await_rename' : 'await_invite', event: e, createdAt: now(), promptMsgId: msg2.message_id };
       state.save();
+      return;
+    }
+
+    // «Пропустить эти дни» при конфликте серии: cal:skipdays:<key> (24.07)
+    const skip = /^cal:skipdays:(.+)$/.exec(cb.data || '');
+    if (skip) {
+      const pending = state.data.pending[chatId];
+      if (!pending || pending.action !== 'create_recur_conflict' || pending.key !== skip[1]) {
+        await tg.send(chatId, R.rStaleButton());
+        return;
+      }
+      delete state.data.pending[chatId];
+      state.save();
+      await stripButtons(chatId, pending, '⏭ Пропустить эти дни');
+      await doCreateRecur(chatId, pending.ev, pending.recurDesc, pending.exdates);
+      return;
+    }
+
+    // Объём операции с серией: cal:scope:<key>:one|fol|all|x (24.07)
+    const sc = /^cal:scope:([^:]+):(one|fol|all|x)$/.exec(cb.data || '');
+    if (sc) {
+      const pending = state.data.pending[chatId];
+      if (!pending || pending.kind !== 'series_scope' || pending.key !== sc[1]) {
+        await tg.send(chatId, R.rStaleButton());
+        return;
+      }
+      delete state.data.pending[chatId];
+      state.save();
+      if (sc[2] === 'x') {
+        await stripButtons(chatId, pending, '❌ Отмена');
+        await tg.send(chatId, pending.action === 'delete' ? R.rDeleteCancelled() : R.rMoveCancelled());
+        return;
+      }
+      const label = sc[2] === 'one' ? 'Только эту' : sc[2] === 'fol' ? 'Эту и все следующие' : 'Всю серию';
+      await stripButtons(chatId, pending, `☑️ ${label}`);
+      if (pending.action === 'delete') await confirmSeriesDelete(chatId, pending.target, sc[2]);
+      else await continueSeriesMove(chatId, pending.target, pending.c || {}, sc[2]);
       return;
     }
 
@@ -991,15 +1393,22 @@ export function createRouter(deps) {
       delete state.data.pending[chatId];
       state.save();
       const yesLabel = pending.action === 'delete' ? '✅ Да, удалить'
-        : pending.action === 'move_all' ? '✅ Да, перенести' : '✅ Всё равно';
+        : pending.action === 'move_all' ? '✅ Да, перенести'
+        : pending.action === 'create_recur' ? '✅ Поставить' : '✅ Всё равно';
       await stripButtons(chatId, pending, yesLabel);
       if (pending.action === 'delete') await doDelete(chatId, pending);
       else if (pending.action === 'move_all') await doMoveAll(chatId, pending);
       else if (pending.action === 'move') await doMove(chatId, pending);
+      else if (pending.action === 'create_recur') await recurGateOrCreate(chatId, pending.ev, pending.recurDesc);
+      else if (pending.action === 'create_recur_conflict') await doCreateRecur(chatId, pending.ev, pending.recurDesc, []);
       else await doCreate(chatId, pending.ev);
       return;
     }
-    if (pending.action === 'delete' || pending.action === 'move_all') { await tg.send(chatId, R.rStaleButton()); return; }
+    if (pending.action === 'delete' || pending.action === 'move_all'
+      || pending.action === 'create_recur' || pending.action === 'create_recur_conflict') {
+      await tg.send(chatId, R.rStaleButton());
+      return;
+    }
     // reschedule → просим новое время (forceReply)
     await stripButtons(chatId, pending, '🔁 Перенести');
     const msg = await tg.send(chatId, R.rAskNewTime(zoneLabel(calTz(), now())), { forceReply: true });
@@ -1047,6 +1456,13 @@ export function createRouter(deps) {
     if ((!gotTime && !parsed?.date) || !ev.time) { await tg.send(chatId, R.rBadTime(tzLabel())); return; }
     delete state.data.pending[chatId];
     state.save();
+    // Перенос всей серии / хвоста (24.07): время получено — применяем к серии.
+    if (pending.seriesScope && pending.seriesTarget) {
+      const c2 = { time_start: ev.time };
+      if (pending.seriesScope === 'all') await doMoveSeriesAll(chatId, pending.seriesTarget, c2);
+      else await doMoveSeriesFollowing(chatId, pending.seriesTarget, c2);
+      return;
+    }
     // «в 8» в ответе — уточняем утра/вечера (правка 23.07 вечер)
     if (ampmAmbiguous(text, ev.time)) {
       await askAmPm(chatId, ev, pending.action === 'move' ? 'move' : 'create',
@@ -1054,7 +1470,8 @@ export function createRouter(deps) {
       return;
     }
     if (pending.action === 'move') await resolveAndMaybeMove(chatId, { ...pending, ev });
-    else await resolveAndMaybeCreate(chatId, ev);
+    // Создание — через общую цепочку: у серии впереди ещё вопрос «докуда?» (24.07)
+    else await askTimeOrCreate(chatId, ev);
   }
 
   // ── Главный обработчик update ────────────────────────────────
@@ -1128,7 +1545,8 @@ export function createRouter(deps) {
             if (!emails.length) { await tg.send(chatId, R.rFail()); return; }
             patch = { attendees: [...new Set([...(pending.event.attendees || []), ...emails])].map((em) => ({ email: em })) };
           }
-          const raw = await gcal.patchEvent(pending.event.id, patch);
+          // Экземпляр серии → правим мастер: переименование/участники = вся серия (24.07)
+          const raw = await gcal.patchEvent(pending.event.recurringEventId || pending.event.id, patch);
           await refreshCache();
           await tg.send(chatId, R.rUpdated(viewFromEvent(normEvent(raw), calTz())));
         } catch (e) {
@@ -1146,6 +1564,34 @@ export function createRouter(deps) {
         const ev = { ...pending.ev, title: cleanTitle(text) };
         if (pending.ampm && ev.time) { await askAmPm(chatId, ev, 'create'); return; }
         await askTimeOrCreate(chatId, ev);
+        return;
+      }
+
+      // Ответ на «Как часто повторять?» — серия без частоты (24.07)
+      if (pending && pending.kind === 'await_recur_freq') {
+        const p = parseRecurPhrase(text);
+        if (!p) { await tg.send(chatId, R.rBadRecur()); return; }
+        delete state.data.pending[chatId];
+        state.save();
+        const ev = { ...pending.ev, recur: { count: 0, untilISO: '', ...(pending.ev.recur || {}), ...p } };
+        const w = parseWhen(text, calTz(), now()); // «каждый ПН в 11» — время прямо в ответе
+        if (w?.time && !ev.time) ev.time = w.time;
+        await askTimeOrCreate(chatId, ev);
+        return;
+      }
+
+      // Ответ на «Докуда повторять?» (24.07)
+      if (pending && pending.kind === 'await_recur_end') {
+        const first = DateTime.fromISO(`${pending.ev.date}T${pending.ev.time}`, { zone: pending.ev.tz });
+        const e = parseRecurEnd(text, first);
+        if (!e) { await tg.send(chatId, R.rBadRecurEnd()); return; }
+        delete state.data.pending[chatId];
+        state.save();
+        const recur = { ...pending.ev.recur };
+        if (e.none) recur.endless = true;
+        else if (e.count) recur.count = e.count;
+        else recur.untilISO = e.untilISO;
+        await askTimeOrCreate(chatId, { ...pending.ev, recur });
         return;
       }
 

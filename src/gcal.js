@@ -86,6 +86,7 @@ export function createGcal({ credsFile, calendarId = 'primary', fetchFn = fetch 
       if (ev.attendees?.length) body.attendees = ev.attendees.map((e) => ({ email: e }));
       if (ev.location) body.location = ev.location;
       if (ev.description) body.description = ev.description;
+      if (ev.recurrence?.length) body.recurrence = ev.recurrence; // серия: RRULE/EXDATE
       if (meet) {
         body.conferenceData = {
           createRequest: {
@@ -98,6 +99,11 @@ export function createGcal({ credsFile, calendarId = 'primary', fetchFn = fetch 
         query: { conferenceDataVersion: '1', sendUpdates: 'all' },
         body,
       });
+    },
+    // Одно событие по id — мастер серии для операций «вся серия / следующие»
+    // (в списках его нет: singleEvents=true отдаёт только экземпляры).
+    async getEvent(eventId) {
+      return call('GET', `/calendars/${cid()}/events/${encodeURIComponent(eventId)}`);
     },
     async patchEvent(eventId, patch) {
       return call('PATCH', `/calendars/${cid()}/events/${encodeURIComponent(eventId)}`, {

@@ -32,10 +32,10 @@ get_timezone (какая у меня зона),
 other (всё остальное: вопросы, болтовня).
 
 Поля:
-- create: {"intent":"create","title":str,"date":"YYYY-MM-DD","time_start":"HH:MM"|"","time_end":"HH:MM"|"","duration_min":str,"attendees":[emails],"location":str,"description":str,"city":str}
+- create: {"intent":"create","title":str,"date":"YYYY-MM-DD","time_start":"HH:MM"|"","time_end":"HH:MM"|"","duration_min":str,"attendees":[emails],"location":str,"description":str,"city":str,"recur":{"freq":"daily|weekly|monthly|","byday":["MO"|"TU"|"WE"|"TH"|"FR"|"SA"|"SU"],"interval":"1","count":"","until":"YYYY-MM-DD"|""}}
 - find: {"intent":"find","titles":[str],"date":"YYYY-MM-DD"|"","time_start":"HH:MM"|""}
-- delete: {"intent":"delete","titles":[str],"date":"YYYY-MM-DD"|"","time_start":"HH:MM"|""}
-- update: {"intent":"update","title":str,"titles":[str],"new_title":str|"","date":"YYYY-MM-DD"|"","time_start":"HH:MM"|"","shift_min":str|"","duration_min":str|"","attendees_add":[emails],"description":str,"city":str}
+- delete: {"intent":"delete","titles":[str],"date":"YYYY-MM-DD"|"","time_start":"HH:MM"|"","series_scope":"one|following|all|"}
+- update: {"intent":"update","title":str,"titles":[str],"new_title":str|"","date":"YYYY-MM-DD"|"","time_start":"HH:MM"|"","shift_min":str|"","duration_min":str|"","attendees_add":[emails],"description":str,"city":str,"series_scope":"one|following|all|"}
 - weekday|specific_date: {"intent":...,"date":"YYYY-MM-DD"}
 - delete_all: {"intent":"delete_all","range":"today|tomorrow|week|next_week|specific_date","date":"YYYY-MM-DD"|""}
 - move_all: {"intent":"move_all","range":"today|tomorrow|week|next_week|specific_date","date":"","shift_days":"7"} — «на неделю вперёд»→"7", «на день/на завтра»→"1", «на два дня»→"2". Период не назван → range:"week".
@@ -55,7 +55,14 @@ other (всё остальное: вопросы, болтовня).
 10. Для find/delete/update встречу можно указать БЕЗ названия — датой и временем («встречу в воскресенье в 11», «сегодняшнюю встречу в 20:00»): тогда titles:[], date и time_start заполни.
 11. «Перенеси X и Y на завтра» (несколько названных встреч) → update, titles:["X","Y"], date.
 12. Относительный сдвиг: «перенеси на час вперёд/позже» → update, shift_min:"60"; «на 30 минут раньше/назад» → shift_min:"-30". time_start при этом НЕ заполняй.
-13. Просьба ТОЛЬКО найти/показать (без изменений) — ВСЕГДА intent find, даже если названы день или время.`;
+13. Просьба ТОЛЬКО найти/показать (без изменений) — ВСЕГДА intent find, даже если названы день или время.
+14. recur — ТОЛЬКО если пользователь сказал о повторении («каждый вторник», «по будням», «ежедневно», «повторяющаяся встреча»). Иначе поле recur НЕ добавляй вообще.
+   «каждый вторник» → {"freq":"weekly","byday":["TU"],"interval":"1"}; «по будням» → byday:["MO","TU","WE","TH","FR"]; «каждый день» → freq:"daily"; «каждую вторую субботу» → freq:"weekly", byday:["SA"], interval:"2".
+   «10 раз» → count:"10"; «до конца августа» / «до 15 сентября» → until (посчитай дату); «на 8 недель» → until = дата первой встречи + 8 недель − 1 день. Конец не назван — count:"" и until:"".
+   Сказал «повторяющуюся встречу», но КАК ЧАСТО — нет → recur:{"freq":"","byday":[],"interval":"1","count":"","until":""}.
+   date для повторяющейся встречи = дата ПЕРВОГО повторения, если названа явно, иначе сегодняшняя (код сам подвинет до нужного дня недели).
+15. series_scope (для delete/update повторяющихся встреч): «серию/всю серию/все занятия» → "all"; «только эту/только ближайшую/один раз» → "one"; «эту и следующие/начиная с этой» → "following"; не сказано → "".
+16. «Удали/перенеси йогу в понедельник» (конкретный день повторяющейся встречи) — это НЕ series_scope:"all": заполни date, series_scope:"".`;
 }
 
 // format — ровно два варианта:
@@ -73,7 +80,7 @@ export function createClassifier({ baseUrl, apiKey, model, format = 'minimax', f
           temperature: 0,
           // Стабильный session-key: gateway OpenClaw создаёт сессию агента на каждый
           // запрос без него — за день накапливаются сотни пустых сессий.
-          user: 'secretary-bot-v4', // суффикс менять при смене промпта: свежая сессия без старой истории
+          user: 'secretary-bot-v5', // суффикс менять при смене промпта: свежая сессия без старой истории
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
         }),
       });

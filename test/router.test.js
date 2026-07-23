@@ -136,7 +136,7 @@ test('п.5: протухшая кнопка → 6.9, не тишина', async (
   const deps = makeDeps({});
   const router = createRouter(deps);
   await router.refreshCache();
-  await router.handleUpdate(cb('cal:add:111111111_deadbeef'));
+  await router.handleUpdate(cb('cal:add:83494179_deadbeef'));
   assert.ok(deps.tg.sent.at(-1).html.startsWith('<b>⚠️ Кнопка устарела</b>'));
 });
 

@@ -1,6 +1,6 @@
 # Связка 1 — Личный ИИ-секретарь в Telegram
 
-Бот ведёт ваш Google Календарь голосом и текстом: ставит, переносит и удаляет встречи, вшивает ссылки Google Meet и Zoom, напоминает, присылает план дня и показывает свободные окна.
+Бот ведёт ваш Google Календарь голосом и текстом: ставит, переносит и удаляет встречи (включая повторяющиеся серии — «йога каждый ПН и ПТ на 8 недель»), вшивает ссылки Google Meet и Zoom, напоминает, присылает план дня и показывает свободные окна.
 
 Пошаговая инструкция сборки: **https://edu.stas-pankov.app/svyazka-1/**
 Техзадание и чек-лист приёмки — в папке [docs/](docs/).
@@ -86,7 +86,7 @@ docker logs secretary-bot   # должно быть: calendar tz: …, menu regi
 ## Проверка
 
 ```bash
-npm install && npm test     # 135 автотестов
+npm install && npm test     # 173 автотеста
 docker compose run --rm secretary-bot node scripts/live-smoke.js   # живые API
 ```
 
@@ -103,7 +103,7 @@ docker compose run --rm secretary-bot node scripts/live-smoke.js   # живые 
 | `src/tz.js` / `src/dates.js` | ~130 городов мира + GMT±N, часовые пояса, диапазоны дат |
 | `src/gcal.js` / `src/zoom.js` / `src/telegram.js` / `src/transcribe.js` | Клиенты API |
 | `src/state.js` / `src/slots.js` / `src/conflict.js` / `src/views.js` | Состояние, свободные окна, конфликты, карточки |
-| `test/` | 135 автотестов (`node --test`) |
+| `test/` | 173 автотеста (`node --test`) |
 
 ## Безопасность
 

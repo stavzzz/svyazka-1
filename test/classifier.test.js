@@ -28,6 +28,19 @@ test('minimax-формат: /v1/messages, x-api-key, парсинг content-бл
   assert.ok(cap.body.system.includes('Сегодня: 2026-07-22'));
 });
 
+test('промпт: инструкции recurrence (recur, series_scope) на месте', async () => {
+  const cap = {};
+  const c = createClassifier({
+    baseUrl: 'x://b', apiKey: 'k', model: 'm',
+    fetchFn: mockFetch({ content: [{ type: 'text', text: '{"intent":"other"}' }] }, cap),
+  });
+  await c.classify('тест', CTX);
+  assert.ok(cap.body.system.includes('"recur"'));
+  assert.ok(cap.body.system.includes('"series_scope"'));
+  assert.ok(cap.body.system.includes('каждую вторую субботу'));
+  assert.ok(cap.body.system.includes('повторяющуюся встречу'));
+});
+
 test('openai-формат: /chat/completions, Bearer, парсинг choices (Codex через OpenClaw gateway)', async () => {
   const cap = {};
   const c = createClassifier({

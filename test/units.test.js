@@ -149,8 +149,8 @@ test('state: sweep чистит pending>1ч и alerted>24ч', () => {
 });
 
 test('newPendingKey: формат <chat_id>_<8 симв>, ≤64 байта, без кириллицы', () => {
-  const k = newPendingKey(111111111);
-  assert.match(k, /^111111111_[A-Za-z0-9_-]{8}$/);
+  const k = newPendingKey(83494179);
+  assert.match(k, /^83494179_[A-Za-z0-9_-]{8}$/);
   assert.ok(Buffer.byteLength(`cal:reschedule:${k}`) <= 64);
 });
 
