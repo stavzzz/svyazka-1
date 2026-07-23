@@ -39,8 +39,27 @@ export function createRouter(deps) {
     const min = new Date(nowMs - 24 * 3600_000).toISOString();
     const max = new Date(nowMs + 60 * 24 * 3600_000).toISOString();
     const events = (await gcal.listEvents(min, max)).map(normEvent);
+    const prev = state.data.cache.events || [];
     state.data.cache = { tz, events, fetchedAt: nowMs };
     state.save();
+    await notifyAttendeeResponses(prev, events).catch((e) => console.error('att notify:', e.message));
+  }
+
+  // Участник ответил на приглашение (правка 23.07 вечер): сравниваем responseStatus
+  // между прошлым и свежим кэшем; Gmail не нужен — Calendar API отдаёт статус сам.
+  async function notifyAttendeeResponses(prevEvents, events) {
+    if (!prevEvents.length) return; // первый запуск — нет базы для сравнения
+    const prevById = new Map(prevEvents.map((e) => [e.id, e]));
+    for (const e of events) {
+      const old = prevById.get(e.id);
+      if (!old || !e.attStatus) continue;
+      for (const [email, status] of Object.entries(e.attStatus)) {
+        const was = old.attStatus?.[email];
+        if (was === undefined || was === status) continue;
+        if (status !== 'accepted' && status !== 'declined' && status !== 'tentative') continue;
+        await tg.send(cfg.ownerChatId, R.rAttendeeResponse(viewFromEvent(e, calTz()), email, status));
+      }
+    }
   }
 
   // ── Представление ещё не созданного события (pending) ───────
@@ -146,10 +165,12 @@ export function createRouter(deps) {
   async function doMove(chatId, pending) {
     const { ev, eventId } = pending;
     const { start, end } = pendingView(ev);
-    const raw = await gcal.patchEvent(eventId, {
+    const patch = {
       start: { dateTime: start.toISO(), timeZone: ev.tz },
       end: { dateTime: end.toISO(), timeZone: ev.tz },
-    });
+    };
+    if (pending.newTitle) patch.summary = pending.newTitle; // перенос + переименование разом
+    const raw = await gcal.patchEvent(eventId, patch);
     await refreshCache();
     await tg.send(chatId, R.rMoved([viewFromEvent(normEvent(raw), calTz())]));
   }
@@ -226,6 +247,26 @@ export function createRouter(deps) {
 
   // ── Обработчики интентов ─────────────────────────────────────
 
+  // «в 8» без «утра/вечера» — неоднозначно (правка 23.07 вечер): 1–11 часов,
+  // ровный час, в тексте голое число без маркера и без двоеточия.
+  function ampmAmbiguous(text, time) {
+    if (!/^\d{2}:00$/.test(time || '')) return false;
+    const h = +time.slice(0, 2);
+    if (h < 1 || h > 11) return false;
+    // граница слова: «сегоДНЯ» — не маркер, «3 часа дня» — маркер
+    if (/(?<![а-яёa-z])(утр|вечер|ночи|ночью|дня(?![а-яё])|дн[её]м|полдень|полдн|am|pm)/i.test(text || '')) return false;
+    return new RegExp('(?:^|[^:.\\d])(?:в|на)\\s+0?' + h + '(?![:.\\d])', 'i').test(text || '');
+  }
+
+  // Спросить «утра или вечера?» кнопками; продолжение — в handleCallback (cal:am/cal:pm).
+  async function askAmPm(chatId, ev, action, extra = {}) {
+    const key = newPendingKey(chatId);
+    const html = R.rAskAmPm(ev.title, +ev.time.slice(0, 2));
+    const sent = await tg.send(chatId, html, { buttons: R.ampmButtons(key) });
+    state.data.pending[chatId] = { key, kind: 'await_ampm', action, ev, ...extra, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+    state.save();
+  }
+
   // Нет времени → спросить время (forceReply), есть → к конфликт-гейту.
   async function askTimeOrCreate(chatId, ev) {
     if (!ev.time) {
@@ -238,7 +279,7 @@ export function createRouter(deps) {
     await resolveAndMaybeCreate(chatId, ev);
   }
 
-  async function handleCreate(chatId, c) {
+  async function handleCreate(chatId, c, text) {
     const city = c.city ? detectCity(c.city) : null;
     const ev = {
       title: (c.title || '').trim(),
@@ -250,14 +291,16 @@ export function createRouter(deps) {
       location: c.location || '',
       description: c.description || '',
     };
+    const ampm = Boolean(ev.time) && ampmAmbiguous(text, ev.time);
     // Правка 23.07: без названия НЕ создаём «Встречу» — спрашиваем название.
     if (!ev.title) {
       const key = newPendingKey(chatId);
       const sent = await tg.send(chatId, R.rAskTitle(), { forceReply: true });
-      state.data.pending[chatId] = { key, kind: 'await_title', action: 'create', ev, createdAt: now(), promptMsgId: sent.message_id };
+      state.data.pending[chatId] = { key, kind: 'await_title', action: 'create', ev, ampm, createdAt: now(), promptMsgId: sent.message_id };
       state.save();
       return;
     }
+    if (ampm) { await askAmPm(chatId, ev, 'create'); return; }
     await askTimeOrCreate(chatId, ev);
   }
 
@@ -367,6 +410,12 @@ export function createRouter(deps) {
         const byText = searchInText(text);
         if (byText.length) return { found: byText, notFound: [] };
       }
+      // Фолбэк 2: указана дата/время без названия («встречу в ВС в 11»)
+      if (!found.length && !titles.length) {
+        const bySlot = searchBySlot(c.date, c.time_start);
+        if (bySlot.length > 1) return { ambiguous: bySlot };
+        if (bySlot.length) return { found: bySlot, notFound: [] };
+      }
       return { found, notFound };
     };
     let r = attempt();
@@ -389,6 +438,22 @@ export function createRouter(deps) {
     state.save();
   }
 
+  // Поиск по дате/времени без названия (правка 23.07 вечер): «встречу в ВС в 11:00».
+  function searchBySlot(date, time) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return [];
+    const tz = calTz();
+    const d0 = DateTime.fromISO(date, { zone: tz }).startOf('day');
+    const d1 = d0.plus({ days: 1 });
+    const evs = state.data.cache.events.filter((e) =>
+      e.status !== 'cancelled' && !e.allDay &&
+      e.startMs >= d0.toMillis() && e.startMs < d1.toMillis());
+    if (!/^\d{2}:\d{2}$/.test(time || '')) return evs;
+    const exact = evs.filter((e) => DateTime.fromMillis(e.startMs, { zone: tz }).toFormat('HH:mm') === time);
+    if (exact.length) return exact;
+    const tMs = d0.plus({ hours: +time.slice(0, 2), minutes: +time.slice(3) }).toMillis();
+    return evs.filter((e) => e.startMs <= tMs && e.endMs > tMs); // идущая в этот момент
+  }
+
   // Интент find (правка 23.07): «найди/покажи встречу X» → карточки, ничего не меняем.
   async function handleFind(chatId, c, text) {
     const titles = (c.titles && c.titles.length ? c.titles : [c.title]).filter(Boolean);
@@ -396,6 +461,7 @@ export function createRouter(deps) {
       const found = [];
       for (const t of titles) found.push(...searchByTitle(t));
       if (!found.length) found.push(...searchInText(text));
+      if (!found.length && !titles.length) found.push(...searchBySlot(c.date, c.time_start));
       const seen = new Set();
       return found.filter((e) => !seen.has(e.id) && seen.add(e.id));
     };
@@ -471,9 +537,47 @@ export function createRouter(deps) {
     await tg.send(chatId, R.rDeleted(pending.events.map((e) => viewFromEvent(e, calTz())), pending.notFound));
   }
 
+  // Несколько названных встреч одной фразой: «перенеси X и Y на завтра» (правка 23.07 вечер).
+  async function moveNamed(chatId, targets, c) {
+    const moved = [];
+    for (const target of targets) {
+      const tz = target.tz || calTz();
+      const oldStart = DateTime.fromMillis(target.startMs, { zone: tz });
+      const durMs = target.endMs - target.startMs;
+      const date = c.date || oldStart.toISODate();
+      const time = c.time_start || oldStart.toFormat('HH:mm');
+      const s = DateTime.fromISO(`${date}T${time}`, { zone: tz });
+      try {
+        const raw = await gcal.patchEvent(target.id, {
+          start: { dateTime: s.toISO(), timeZone: tz },
+          end: { dateTime: s.plus({ milliseconds: durMs }).toISO(), timeZone: tz },
+        });
+        moved.push(normEvent(raw));
+      } catch (e) { console.error('move named failed:', e.message); }
+    }
+    await refreshCache();
+    if (!moved.length) { await tg.send(chatId, R.rCalError()); return; }
+    await tg.send(chatId, R.rMoved(moved.map((m) => viewFromEvent(m, calTz()))));
+  }
+
   async function handleUpdate(chatId, c, text) {
+    // Несколько названий → перенос каждой (как массовый, без конфликт-гейта)
+    const multi = (c.titles || []).filter(Boolean);
+    if (multi.length > 1 && (c.date || c.time_start)) {
+      const targets = [];
+      const missing = [];
+      for (const t of multi) {
+        let m = searchByTitle(t);
+        if (!m.length) { await refreshCache().catch(() => {}); m = searchByTitle(t); }
+        if (m.length) targets.push(...m); else missing.push(t);
+      }
+      if (!targets.length) { await tg.send(chatId, R.rNotFound(multi)); return; }
+      await moveNamed(chatId, targets, c);
+      if (missing.length) await tg.send(chatId, R.rNotFound(missing));
+      return;
+    }
     const attempt = () => {
-      let m = searchByTitle(c.title || '');
+      let m = searchByTitle(c.title || (multi[0] || ''));
       if (!m.length) m = searchInText(text); // фолбэк по тексту сообщения
       return m;
     };
@@ -489,6 +593,7 @@ export function createRouter(deps) {
 
   async function applyUpdate(chatId, target, c) {
     const timeChanged = Boolean(c.date || c.time_start);
+    const newTitle = (c.new_title || '').trim(); // переименование (правка 23.07 вечер)
 
     if (timeChanged) {
       const city = c.city ? detectCity(c.city) : null;
@@ -496,18 +601,19 @@ export function createRouter(deps) {
       const oldStart = DateTime.fromMillis(target.startMs, { zone: tz });
       const oldDurMin = Math.round((target.endMs - target.startMs) / 60000);
       const ev = {
-        title: target.summary,
+        title: newTitle || target.summary,
         date: c.date || oldStart.toISODate(),
         time: c.time_start || oldStart.toFormat('HH:mm'),
         tz,
         durationMin: parseInt(c.duration_min, 10) > 0 ? parseInt(c.duration_min, 10) : oldDurMin,
       };
-      await resolveAndMaybeMove(chatId, { kind: 'confirm', action: 'move', ev, eventId: target.id });
+      await resolveAndMaybeMove(chatId, { kind: 'confirm', action: 'move', ev, eventId: target.id, newTitle });
       return;
     }
 
-    // Изменения без переноса: длительность / участники / описание
+    // Изменения без переноса: новое название / длительность / участники / описание
     const patch = {};
+    if (newTitle) patch.summary = newTitle;
     if (parseInt(c.duration_min, 10) > 0) {
       const end = DateTime.fromMillis(target.startMs).plus({ minutes: parseInt(c.duration_min, 10) });
       patch.end = { dateTime: end.toISO(), timeZone: target.tz || calTz() };
@@ -696,6 +802,24 @@ export function createRouter(deps) {
     log('btn', cb.data || '');
     if ((cb.data || '').startsWith('set:')) { await handleSettingsCallback(cb); return; }
 
+    // Кнопки «утра/вечера»: cal:am|pm:<key> (правка 23.07 вечер)
+    const ampm = /^cal:(am|pm):(.+)$/.exec(cb.data || '');
+    if (ampm) {
+      const pending = state.data.pending[chatId];
+      if (!pending || pending.kind !== 'await_ampm' || pending.key !== ampm[2]) {
+        await tg.send(chatId, R.rStaleButton());
+        return;
+      }
+      delete state.data.pending[chatId];
+      state.save();
+      const ev = { ...pending.ev };
+      if (ampm[1] === 'pm') ev.time = `${String((+ev.time.slice(0, 2) % 12) + 12).padStart(2, '0')}:00`;
+      await stripButtons(chatId, pending, ampm[1] === 'pm' ? '🌆 Вечера' : '🌅 Утра');
+      if (pending.action === 'move') await resolveAndMaybeMove(chatId, { ...pending, kind: 'confirm', ev });
+      else await askTimeOrCreate(chatId, ev);
+      return;
+    }
+
     // Выбор из «Найдено несколько»: cal:pick:<key>:<idx|all>
     const pick = /^cal:pick:([^:]+):(\d+|all)$/.exec(cb.data || '');
     if (pick) {
@@ -756,12 +880,15 @@ export function createRouter(deps) {
     if (parsed?.date) ev.date = parsed.date;
     ev.tz = parsed?.tz || calTz();
 
-    // В ответе наговорили не только время, а ещё детали (длительность, описание,
-    // место, участники) — вытаскиваем их классификатором и вливаем в встречу.
-    if (text.length > 40) {
+    // В ответе наговорили не только время, а ещё детали (название, длительность,
+    // описание, место, участники) — вытаскиваем их классификатором и вливаем в встречу.
+    if (text.length > 40 || /назов|названием/i.test(text)) {
       try {
         const c = await classifier.classify(text, classifyCtx());
         if (c.intent === 'create' || c.intent === 'update') {
+          // «…назови встречу тест» в ответе на вопрос времени (правка 23.07 вечер)
+          const namedTitle = (c.title || c.new_title || '').trim();
+          if (namedTitle) ev.title = namedTitle;
           const dur = parseInt(c.duration_min, 10);
           if (dur > 0) ev.durationMin = dur;
           if (c.description) ev.description = c.description;
@@ -782,6 +909,12 @@ export function createRouter(deps) {
     if ((!gotTime && !parsed?.date) || !ev.time) { await tg.send(chatId, R.rBadTime(tzLabel())); return; }
     delete state.data.pending[chatId];
     state.save();
+    // «в 8» в ответе — уточняем утра/вечера (правка 23.07 вечер)
+    if (ampmAmbiguous(text, ev.time)) {
+      await askAmPm(chatId, ev, pending.action === 'move' ? 'move' : 'create',
+        pending.action === 'move' ? { eventId: pending.eventId, newTitle: pending.newTitle } : {});
+      return;
+    }
     if (pending.action === 'move') await resolveAndMaybeMove(chatId, { ...pending, ev });
     else await resolveAndMaybeCreate(chatId, ev);
   }
@@ -847,7 +980,20 @@ export function createRouter(deps) {
         delete state.data.pending[chatId];
         state.save();
         const ev = { ...pending.ev, title: text.trim().slice(0, 80) };
+        if (pending.ampm && ev.time) { await askAmPm(chatId, ev, 'create'); return; }
         await askTimeOrCreate(chatId, ev);
+        return;
+      }
+
+      // Ответ текстом на вопрос «утра или вечера?» (кнопки — в handleCallback)
+      if (pending && pending.kind === 'await_ampm' && /утр|вечер|ночи|дня|дн[её]м/i.test(text)) {
+        delete state.data.pending[chatId];
+        state.save();
+        const ev = { ...pending.ev };
+        if (/вечер|ночи/i.test(text)) ev.time = `${String((+ev.time.slice(0, 2) % 12) + 12).padStart(2, '0')}:00`;
+        await stripButtons(chatId, pending, /вечер|ночи/i.test(text) ? '🌆 Вечера' : '🌅 Утра');
+        if (pending.action === 'move') await resolveAndMaybeMove(chatId, { ...pending, kind: 'confirm', ev });
+        else await askTimeOrCreate(chatId, ev);
         return;
       }
 
@@ -876,7 +1022,7 @@ export function createRouter(deps) {
       log('intent', JSON.stringify(c).slice(0, 300));
 
       switch (c.intent) {
-        case 'create': await handleCreate(chatId, c); break;
+        case 'create': await handleCreate(chatId, c, text); break;
         case 'today': case 'tomorrow': case 'day_after_tomorrow':
         case 'weekday': case 'week': case 'next_week': case 'specific_date':
           await handleSchedule(chatId, c.intent, c); break;

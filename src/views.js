@@ -27,6 +27,11 @@ export function normEvent(raw) {
     location: raw.location || '',
     description: raw.description || '',
     attendees: (raw.attendees || []).filter((a) => !a.self && !a.resource).map((a) => a.email),
+    // email → responseStatus (needsAction/accepted/declined/tentative) — для
+    // уведомлений «участник принял» (правка 23.07 вечер; Calendar API отдаёт сам)
+    attStatus: Object.fromEntries((raw.attendees || [])
+      .filter((a) => !a.self && !a.resource)
+      .map((a) => [a.email, a.responseStatus || 'needsAction'])),
     meet: meetLink(raw),
     zoom: (raw.description || '').match(ZOOM_RX)?.[1] || '',
   };

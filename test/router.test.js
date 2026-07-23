@@ -607,3 +607,119 @@ test('лог диалога: текст, интент и результат по
   assert.ok(lines.some((l) => l.startsWith('intent {"intent":"today"')));
   assert.ok(lines.some((l) => l === 'done today'));
 });
+
+// ── Правки 23.07 (вечер): rename, title в ответе, слот-поиск, мульти-перенос, утра/вечера, приглашения ──
+import { DateTime as DT } from 'luxon';
+
+test('№5 rename: «переименуй Тест в Тестовый созвон» меняет название', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'переименуй': { intent: 'update', title: 'тест', new_title: 'Тестовый созвон' } },
+    gcalOpts: { events: [rawEvent('r1', 'Тест', '2026-07-24T23:00:00', '2026-07-25T00:00:00')] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('переименуй тест в тестовый созвон'));
+  const patch = deps.gcal.calls.find((c) => c[0] === 'patch');
+  assert.equal(patch[2].summary, 'Тестовый созвон');
+  assert.match(deps.tg.sent.at(-1).html, /Тестовый созвон/);
+});
+
+test('№6 «назови встречу Тест» в ответе на вопрос времени — применяется', async () => {
+  const deps = makeDeps({ classifierMap: {
+    'встреча с Иваном': { intent: 'create', title: 'Иван', date: '2026-07-23', time_start: '' },
+    'назови встречу Тест': { intent: 'create', title: 'Тест', date: '2026-07-23', time_start: '23:00', duration_min: '180' },
+  } });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('встреча с Иваном завтра'));
+  const ask = deps.tg.sent.at(-1);
+  await router.handleUpdate(msg('на 23:00 продолжительность 3 часа назови встречу Тест', { reply_to_message: { message_id: ask.message_id, text: ask.html } }));
+  const created = deps.gcal.calls.find((c) => c[0] === 'create');
+  assert.equal(created[1].summary, 'Тест');
+});
+
+test('№7 delete по дате и времени без названия', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'отмени': { intent: 'delete', titles: [], date: '2026-07-26', time_start: '11:00' } },
+    gcalOpts: { events: [rawEvent('s1', 'Тест колонок', '2026-07-26T11:00:00', '2026-07-26T13:00:00')] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('отмени встречу в воскресенье в 11'));
+  const out = deps.tg.sent.at(-1).html;
+  assert.ok(out.startsWith('<b>🗑 Удалить встречу?'));
+  assert.match(out, /Тест колонок/);
+});
+
+test('№8 перенос двух названных встреч одной фразой', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'перенеси': { intent: 'update', title: '', titles: ['чтение книги', 'прогулка по квартире'], date: '2026-07-26', time_start: '' } },
+    gcalOpts: { events: [
+      rawEvent('m1', 'Чтение книги', '2026-07-24T21:30:00', '2026-07-24T22:00:00'),
+      rawEvent('m2', 'Прогулка по квартире', '2026-07-23T23:00:00', '2026-07-24T00:30:00'),
+    ] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('перенеси чтение книги и прогулку по квартире на воскресенье'));
+  const patches = deps.gcal.calls.filter((c) => c[0] === 'patch');
+  assert.equal(patches.length, 2);
+  assert.ok(patches.every((p) => p[2].start.dateTime.startsWith('2026-07-26')));
+  const out = deps.tg.sent.at(-1).html;
+  assert.match(out, /перенесены/);
+  assert.match(out, /Чтение книги/);
+  assert.match(out, /Прогулка по квартире/);
+});
+
+test('№10 «на 8» без утра/вечера → вопрос; «Вечера» → 20:00', async () => {
+  const deps = makeDeps({ classifierMap: {
+    'тест 8': { intent: 'create', title: 'Тест 8', date: '2026-07-22', time_start: '08:00' },
+  } });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('поставь встречу тест 8 сегодня на 8'));
+  const ask = deps.tg.sent.at(-1);
+  assert.match(ask.html, /Утра или вечера/);
+  const pm = ask.opts.buttons[0][1].callback_data;
+  assert.match(pm, /^cal:pm:/);
+  await router.handleUpdate(cb(pm));
+  const created = deps.gcal.calls.find((c) => c[0] === 'create');
+  assert.ok(created[1].start.dateTime.includes('T20:00'));
+});
+
+test('№10 «в 15:00» и «на 8 утра» вопросов не вызывают', async () => {
+  const deps = makeDeps({ classifierMap: {
+    'пятнадцать': { intent: 'create', title: 'А', date: '2026-07-22', time_start: '15:00' },
+    'восемь утра': { intent: 'create', title: 'Б', date: '2026-07-22', time_start: '08:00' },
+  } });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('пятнадцать: встреча в 15:00'));
+  assert.match(deps.tg.sent.at(-1).html, /добавлена/);
+  await router.handleUpdate(msg('восемь утра: встреча на 8 утра'));
+  assert.match(deps.tg.sent.at(-1).html, /добавлена/);
+});
+
+test('№11 участник принял приглашение → уведомление в фирменном шаблоне', async () => {
+  const raw = {
+    id: 'a9', summary: 'Полёт на Марс', status: 'confirmed',
+    start: { dateTime: DT.fromISO('2026-07-23T15:00:00', { zone: 'Europe/Moscow' }).toISO(), timeZone: 'Europe/Moscow' },
+    end: { dateTime: DT.fromISO('2026-07-23T16:00:00', { zone: 'Europe/Moscow' }).toISO(), timeZone: 'Europe/Moscow' },
+    htmlLink: 'https://cal/a9',
+    attendees: [{ email: 'vasya@mail.ru', responseStatus: 'needsAction' }],
+  };
+  const deps = makeDeps({ gcalOpts: { events: [raw] } });
+  const router = createRouter(deps);
+  await router.refreshCache();                       // база для сравнения
+  raw.attendees[0].responseStatus = 'accepted';
+  await router.refreshCache();                       // плановое обновление кэша
+  const out = deps.tg.sent.at(-1).html;
+  assert.match(out, /Ответ на приглашение/);
+  assert.match(out, /vasya@mail\.ru/);
+  assert.match(out, /принял/);
+  assert.match(out, /Полёт на Марс/);
+  // повторный refresh без изменений — дубля нет
+  const n = deps.tg.sent.length;
+  await router.refreshCache();
+  assert.equal(deps.tg.sent.length, n);
+});

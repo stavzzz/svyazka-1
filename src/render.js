@@ -92,6 +92,19 @@ export function conflictButtons(pendingKey) {
 // Подсказка про зону (правило А: голое время = зона календаря).
 const tzHint = (zone) => `\n\n<i>⏱ Время без города — в твоей зоне: ${zone}. Хочешь другую — назови город: «на 20 по Москве».</i>`;
 
+// ── «В 8 утра или вечера?» (правка 23.07 вечер) ──────────────────
+export function rAskAmPm(title, hour) {
+  return head('🕗 Утра или вечера?') +
+    (title ? `📌 <b>${esc(title)}</b>\n` : '') +
+    `Ты сказал «в ${hour}» — это ${hour}:00 утра или ${hour + 12}:00 вечера?`;
+}
+export function ampmButtons(pendingKey) {
+  return [[
+    { text: '🌅 Утра', callback_data: `cal:am:${pendingKey}` },
+    { text: '🌆 Вечера', callback_data: `cal:pm:${pendingKey}` },
+  ]];
+}
+
 // ── Уточнение названия (forceReply) — правка 23.07: дефолт «Встреча» убран ──
 export function rAskTitle() {
   return head('📝 Как назвать встречу?') +
@@ -213,6 +226,18 @@ export function deleteButtons(pendingKey) {
 }
 export function rDeleteCancelled() {
   return head('❌ Отмена') + 'Ничего не удалил.';
+}
+
+// ── Участник ответил на приглашение (правка 23.07 вечер) ─────────
+export function rAttendeeResponse(v, email, status) {
+  const M = {
+    accepted: '✅ принял(а) приглашение',
+    declined: '❌ отклонил(а) приглашение',
+    tentative: '🤔 ответил(а) «возможно»',
+  };
+  return head('👥 Ответ на приглашение') +
+    `<b>${esc(email)}</b> ${M[status] || status}\n\n` +
+    eventBlock(v, { withOpen: true });
 }
 
 // ── Интент find — найдено по запросу (правка 23.07) ──────────────

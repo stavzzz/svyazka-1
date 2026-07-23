@@ -70,6 +70,7 @@ export function mockGcal({ tz = 'Europe/Moscow', events = [] } = {}) {
     async patchEvent(id, patch) {
       const raw = store.find((e) => e.id === id);
       if (!raw) throw new Error('404');
+      if (patch.summary) raw.summary = patch.summary;
       if (patch.start) raw.start = { dateTime: patch.start.dateTime, timeZone: patch.start.timeZone };
       if (patch.end) raw.end = { dateTime: patch.end.dateTime, timeZone: patch.end.timeZone };
       if (patch.attendees) raw.attendees = patch.attendees;

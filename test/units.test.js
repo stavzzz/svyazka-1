@@ -182,3 +182,34 @@ test('edit: «message is not modified» глотается без console.error,
     assert.equal(errs.length, 1);
   } finally { console.error = orig; }
 });
+
+// ── Правка 23.07 (вечер): база городов мира + явные GMT-офсеты ──
+test('detectCity: новые города мира', () => {
+  assert.equal(detectCity('поставь по времени Хошимина').tz, 'Asia/Ho_Chi_Minh');
+  assert.equal(detectCity('по времени Сан-Паулу').tz, 'America/Sao_Paulo');
+  assert.equal(detectCity('в Катманду').tz, 'Asia/Kathmandu');
+  assert.equal(detectCity('я на Бали').tz, 'Asia/Makassar');
+  assert.equal(detectCity('прилетел в Сеул').tz, 'Asia/Seoul');
+  assert.equal(detectCity('по Мадриду').tz, 'Europe/Madrid');
+  assert.equal(detectCity('встреча в Мехико').tz, 'America/Mexico_City');
+  assert.equal(detectCity('лечу в Стамбул').tz, 'Europe/Istanbul');
+  assert.equal(detectCity('созвон по Сингапуру').tz, 'Asia/Singapore');
+  assert.equal(detectCity('в Буэнос-Айресе').tz, 'America/Argentina/Buenos_Aires');
+});
+
+test('detectCity: явный офсет GMT+5 / UTC-3 / GMT+5:30', () => {
+  assert.equal(detectCity('поставь на 14 по GMT+5').tz, 'UTC+5');
+  assert.equal(detectCity('utc-3 пожалуйста').tz, 'UTC-3');
+  assert.equal(detectCity('по GMT+5:30').tz, 'UTC+5:30');
+  assert.equal(detectCity('просто gmt').tz, 'Europe/London'); // без знака — Лондон, как раньше
+  const dt = DateTime.fromMillis(NOW, { zone: 'UTC+5' });
+  assert.equal(dt.isValid, true);
+});
+
+test('detectCity: новые стемы не дают ложных срабатываний', () => {
+  assert.equal(detectCity('прочитать властелин колец'), null);
+  assert.equal(detectCity('обсуждение договоров'), null);
+  assert.equal(detectCity('лимонад и карамель'), null);
+  assert.equal(detectCity('пергола на веранде'), null);
+  assert.equal(detectCity('чтение книги'), null);
+});
