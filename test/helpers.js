@@ -93,8 +93,12 @@ export function mockGcal({ tz = 'Europe/Moscow', events = [] } = {}) {
     },
     async deleteEvent(id) {
       const i = store.findIndex((e) => e.id === id);
-      if (i < 0) throw new Error('404');
+      if (i < 0) throw new Error('gcal DELETE: 410 Resource has been deleted');
       store.splice(i, 1);
+      // Как Google: удаление мастера каскадно сносит экземпляры серии
+      for (let j = store.length - 1; j >= 0; j--) {
+        if (store[j].recurringEventId === id) store.splice(j, 1);
+      }
       api.calls.push(['delete', id]);
     },
   };

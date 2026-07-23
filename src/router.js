@@ -564,6 +564,12 @@ export function createRouter(deps) {
     await stripButtons(chatId, pending, idx === 'all' ? '☑️ Выбрано: все' : `☑️ Выбрано: ${idx + 1}`);
     if (pending.action === 'find') { await sendFoundCard(chatId, targets[0]); return; }
     if (pending.action === 'delete') {
+      // Выбранная — экземпляр серии → объём (баг приёмки 23.07 ночь: серия
+      // удалялась как один экземпляр)
+      if (idx !== 'all' && targets[0].recurringEventId) {
+        await askSeriesScope(chatId, targets[0], 'delete', pending.c || {});
+        return;
+      }
       const key = newPendingKey(chatId);
       const html = R.rConfirmDelete(targets.map((t) => viewFromEvent(t, calTz())));
       const sent = await tg.send(chatId, html, { buttons: R.deleteButtons(key) });
@@ -714,7 +720,7 @@ export function createRouter(deps) {
     if (kind === 'delete') {
       const html = R.rConfirmDelete(views, [], more);
       const sent = await tg.send(chatId, html, { buttons: R.deleteButtons(key) });
-      state.data.pending[chatId] = { key, kind: 'confirm', action: 'delete', events, notFound: [], createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+      state.data.pending[chatId] = { key, kind: 'confirm', action: 'delete', events, notFound: [], bulk: true, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
     } else {
       const shiftDays = parseInt(c.shift_days, 10) || 7;
       const html = R.rConfirmMove(views, shiftDays, more);
@@ -762,8 +768,16 @@ export function createRouter(deps) {
       await tg.send(chatId, R.rDeleted([viewFromEvent(target, calTz())], [], R.SCOPE_LABELS[pending.seriesScope]));
       return;
     }
+    // Именованное удаление: экземпляр серии = вся серия (мастер), без дублей.
+    // Массовое за период (bulk) — наоборот, только экземпляры этого периода.
+    // 404/410 = уже удалено (Google каскадит серии) — не ошибка.
+    const gone = new Set();
     for (const ev of pending.events) {
-      try { await gcal.deleteEvent(ev.id); } catch (e) {
+      const id = pending.bulk ? ev.id : (ev.recurringEventId || ev.id);
+      if (gone.has(id)) continue;
+      gone.add(id);
+      try { await gcal.deleteEvent(id); } catch (e) {
+        if (/(^|\D)(404|410)(\D|$)/.test(e.message)) continue;
         console.error('delete failed:', e.message);
         await tg.send(chatId, R.rCalError());
         return;
@@ -1569,6 +1583,11 @@ export function createRouter(deps) {
 
       // Ответ на «Как часто повторять?» — серия без частоты (24.07)
       if (pending && pending.kind === 'await_recur_freq') {
+        // «ПН в 6:30 и ВС в 5:00» — два времени одной серией не бывает (баг приёмки):
+        // честно просим по одной. Диапазоны «с 11 до 12:30» не считаются.
+        const times = new Set((text.replace(/с\s*\d{1,2}[:.]\d{2}\s*до\s*\d{1,2}[:.]\d{2}/g, ' ')
+          .match(/\d{1,2}[:.]\d{2}/g) || []));
+        if (times.size >= 2) { await tg.send(chatId, R.rRecurMultiTime()); return; }
         const p = parseRecurPhrase(text);
         if (!p) { await tg.send(chatId, R.rBadRecur()); return; }
         delete state.data.pending[chatId];

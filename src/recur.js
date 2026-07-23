@@ -53,6 +53,9 @@ const WD_STEMS = [
   ['пятниц', 'FR'], ['суббот', 'SA'], ['воскресен', 'SU'],
 ];
 
+// Сокращения дней («каждый ПН и ПТ в 6:30» — баг приёмки Стаса 23.07 ночь).
+const WD_SHORT = { пн: 'MO', вт: 'TU', ср: 'WE', чт: 'TH', пт: 'FR', сб: 'SA', вс: 'SU' };
+
 // → {freq, byday, interval} | null (повторение в тексте не найдено)
 export function parseRecurPhrase(text) {
   const t = (text || '').toLowerCase().replace(/ё/g, 'е');
@@ -71,6 +74,14 @@ export function parseRecurPhrase(text) {
     if (!m) continue;
     const plural = m.some((w) => /ам$|ям$|и$|ы$/.test(w));
     if (hasKazhd || plural) days.push(code);
+  }
+  // Сокращения токенами («ПН», «по пт») — только в явном контексте повторения,
+  // иначе «поставь встречу в ПТ» ложно станет серией.
+  if (hasKazhd || /(?:^|\s)по\s+(?:пн|вт|ср|чт|пт|сб|вс)(?![а-я])/.test(t)) {
+    for (const tok of t.split(/[^а-я]+/)) {
+      const code = WD_SHORT[tok];
+      if (code && !days.includes(code)) days.push(code);
+    }
   }
   let interval = 1;
   const mN = t.match(/раз в (\d+) недел/);
