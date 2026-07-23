@@ -162,8 +162,12 @@ const CITIES = [
   ['гонолулу|гавай', 'Гонолулу', 'Pacific/Honolulu'],
 ];
 
+// Дефис между буквами — гибкий: «Нью-Йорк» = «НьюЙорк» = «Нью Йорк»
+// (голосовая транскрипция пишет по-разному; баг со скрина Стаса 23.07).
+const flexHyphen = (stem) => stem.replace(/(?<=[а-яё])-(?=[а-яё])/g, '[-\\s]?');
+
 const COMPILED = CITIES.map(([stem, name, tz]) => ({
-  rx: new RegExp(B + '(?:' + stem + ')', 'i'),
+  rx: new RegExp(B + '(?:' + flexHyphen(stem) + ')', 'i'),
   name,
   tz,
 }));
