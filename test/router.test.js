@@ -930,3 +930,15 @@ test('«удали Тест а» не трогает «Тест б» (точны
   assert.ok(out.startsWith('<b>🗑 Удалить встречу?'));       // одна, без вопроса «какую»
   assert.ok(out.includes('Тест а') && !out.includes('Тест б'));
 });
+
+// ── Правка Стаса 23.07: «печатает…» пока задача в работе ──
+test('typing: индикация при сообщении и при кнопке', async () => {
+  const deps = makeDeps({ classifierMap: { 'что у меня сегодня': { intent: 'today' } } });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('что у меня сегодня'));
+  assert.ok(deps.tg.typingCalls >= 2);              // при получении + перед действием
+  const before = deps.tg.typingCalls;
+  await router.handleUpdate(cb('cal:add:111111111_deadbeef'));
+  assert.ok(deps.tg.typingCalls > before);          // и на кнопках
+});

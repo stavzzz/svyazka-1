@@ -879,6 +879,7 @@ export function createRouter(deps) {
     const chatId = cb.message?.chat?.id;
     if (!chatId || cb.from?.id !== cfg.ownerChatId) return;
     log('btn', cb.data || '');
+    tg.typing(chatId); // «печатает…» и на кнопках
     if ((cb.data || '').startsWith('set:')) { await handleSettingsCallback(cb); return; }
 
     // Кнопки под «Нашёл встречу»: cal:fmove|fren|finv|fdel:<key> (тест 46)
@@ -1045,6 +1046,7 @@ export function createRouter(deps) {
       if (!msg) return;
       const chatId = msg.chat?.id;
       if (msg.from?.id !== cfg.ownerChatId) return; // личный секретарь — только владелец
+      tg.typing(chatId); // «печатает…» — взял в работу (правка Стаса 23.07)
 
       let text = msg.text || '';
       if (msg.voice || msg.audio) {
@@ -1163,6 +1165,7 @@ export function createRouter(deps) {
       });
 
       log('intent', JSON.stringify(c).slice(0, 300));
+      tg.typing(chatId); // классификация долгая — обновить «печатает…» перед действием
 
       switch (c.intent) {
         case 'create': await handleCreate(chatId, c, text); break;

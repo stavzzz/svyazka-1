@@ -56,6 +56,11 @@ export function createTelegram({ token, fetchFn = fetch }) {
         return null;
       }
     },
+    // «Печатает…» пока задача в работе (правка Стаса 23.07). Живёт ~5 с
+    // или до первого отправленного сообщения; сбой индикации не критичен.
+    async typing(chatId) {
+      try { await api('sendChatAction', { chat_id: chatId, action: 'typing' }); } catch { /* не критично */ }
+    },
     async answerCallback(callbackQueryId) {
       try { await api('answerCallbackQuery', { callback_query_id: callbackQueryId }); } catch { /* не критично */ }
     },

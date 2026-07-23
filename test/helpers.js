@@ -26,6 +26,8 @@ export function mockTg() {
       edits.push(m);
       return m;
     },
+    typingCalls: 0,
+    async typing() { this.typingCalls++; },
     async answerCallback() {},
     async getVoice() { return Buffer.from('fake'); },
   };
