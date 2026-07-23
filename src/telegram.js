@@ -50,7 +50,11 @@ export function createTelegram({ token, fetchFn = fetch }) {
       };
       if (buttons) params.reply_markup = { inline_keyboard: buttons };
       try { return await api('editMessageText', params); }
-      catch (e) { console.error('edit failed:', e.message); return null; }
+      catch (e) {
+        // Повторный клик по кнопке шлёт тот же текст — это не ошибка (правка 23.07).
+        if (!/message is not modified/.test(e.message)) console.error('edit failed:', e.message);
+        return null;
+      }
     },
     async answerCallback(callbackQueryId) {
       try { await api('answerCallbackQuery', { callback_query_id: callbackQueryId }); } catch { /* не критично */ }

@@ -2,7 +2,7 @@
 // Здесь же: нормализация события, правило двух строк времени, ссылки Meet+Zoom.
 import { DateTime } from 'luxon';
 import { zoneLabel, getClock } from './tz.js';
-import { fmtDateRu } from './dates.js';
+import { fmtDayHeader } from './dates.js';
 import { meetLink } from './gcal.js';
 
 const ZOOM_RX = /Zoom:\s*(https:\/\/\S+)/;
@@ -73,7 +73,7 @@ export function viewFromEvent(ev, calTz) {
   const t = timesFor(ev, calTz);
   return {
     title: ev.summary,
-    dateRu: fmtDateRu(t.local),
+    dateRu: fmtDayHeader(t.local), // «ВС, 26 июля 2026» — день недели везде (правка 23.07)
     clock: t.clock, t1: t.t1, t2: t.t2, zone: t.zone,
     alt: t.alt,
     attendees: ev.attendees,

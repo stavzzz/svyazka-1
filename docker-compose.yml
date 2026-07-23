@@ -3,6 +3,9 @@ services:
     build: .
     container_name: secretary-bot
     restart: unless-stopped
+    # host-сеть: бот достаёт до OpenClaw gateway на 127.0.0.1 (вариант 1).
+    # Для варианта MiniMax это тоже безвредно — бот ничего не слушает.
+    network_mode: host
     env_file: .env
     environment:
       GOOGLE_CREDS_FILE: /creds/google.json

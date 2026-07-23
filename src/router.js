@@ -15,6 +15,8 @@ const WD_RU = ['понедельник', 'вторник', 'среда', 'чет
 
 export function createRouter(deps) {
   const { tg, gcal, zoom, classifier, transcriber, state, cfg, now = () => Date.now() } = deps;
+  // Лог диалога (правка 23.07): каждая фраза, интент и результат — в docker logs.
+  const log = deps.log || ((...a) => console.log(new Date(now()).toISOString(), ...a));
 
   const calTz = () => state.data.cache.tz || cfg.fallbackTz;
   const tzLabel = () => zoneLabel(calTz(), now());
@@ -50,7 +52,7 @@ export function createRouter(deps) {
     const t1 = local.toFormat('HH:mm');
     const view = {
       title: ev.title,
-      dateRu: fmtDateRu(local),
+      dateRu: fmtDayHeader(local),
       clock: getClock(t1), t1, t2: localEnd.toFormat('HH:mm'),
       zone: zoneLabel(calTz(), start.toMillis()),
       alt: null,
@@ -172,25 +174,50 @@ export function createRouter(deps) {
   }
 
   // ── Поиск событий по названию (кэш, будущее окно) ────────────
+  // Правка 23.07: сравнение по словам, устойчивое к падежам («встречУ тест
+  // колонок» ↔ «Тест колонок»): регистр, ё→е, пунктуация, общий префикс ≥4.
+  const STOP_WORDS = new Set(['встреча', 'встречу', 'встречи', 'встрече', 'встречей', 'событие']);
+  function words(s) {
+    return (s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9\s]/gi, ' ')
+      .split(/\s+/).filter((w) => w.length >= 2 || /\d/.test(w)); // «Тест-1»: цифру не терять
+  }
+  // Стоп-слова режем ТОЛЬКО в запросе («удали встречУ тест колонок»);
+  // название события не трогаем, иначе «Созвон» перестанет находиться.
+  function keyWords(s) {
+    const w = words(s);
+    const k = w.filter((x) => !STOP_WORDS.has(x));
+    return k.length ? k : w; // запрос из одних стоп-слов («встреча») — как есть
+  }
+  function tokenPair(a, b) {
+    if (a === b) return true;
+    const n = Math.min(a.length, b.length);
+    return n >= 4 && a.slice(0, n) === b.slice(0, n);
+  }
+  function titleMatches(query, title) {
+    const q = keyWords(query);
+    const t = words(title);
+    if (!q.length || !t.length) return false;
+    return q.every((qw) => t.some((tw) => tokenPair(qw, tw)));
+  }
+
   function searchByTitle(title) {
-    const q = (title || '').trim().toLowerCase();
+    const q = (title || '').trim();
     if (!q) return [];
     return state.data.cache.events.filter((e) =>
       e.status !== 'cancelled' &&
       e.endMs > now() - 3600_000 &&
-      e.summary.toLowerCase().includes(q));
+      titleMatches(q, e.summary));
   }
 
   // Фолбэк: классификатор не вытащил название (запятые, обороты) —
   // ищем названия встреч из кэша прямо в тексте сообщения. Детерминированно.
   function searchInText(text) {
-    const t = (text || '').toLowerCase();
+    const t = (text || '').trim();
     if (!t) return [];
     const seen = new Set();
     return state.data.cache.events.filter((e) => {
       if (e.status === 'cancelled' || e.endMs <= now() - 3600_000) return false;
-      const s = e.summary.toLowerCase();
-      if (s.length < 3 || !t.includes(s)) return false;
+      if (!titleMatches(e.summary, t)) return false; // все слова названия есть в тексте
       if (seen.has(e.id)) return false;
       seen.add(e.id);
       return true;
@@ -199,18 +226,8 @@ export function createRouter(deps) {
 
   // ── Обработчики интентов ─────────────────────────────────────
 
-  async function handleCreate(chatId, c) {
-    const city = c.city ? detectCity(c.city) : null;
-    const ev = {
-      title: (c.title || 'Встреча').trim() || 'Встреча',
-      date: c.date || DateTime.fromMillis(now(), { zone: calTz() }).toISODate(),
-      time: c.time_start || '',
-      tz: city ? city.tz : calTz(),
-      durationMin: computeDuration(c),
-      attendees: c.attendees || [],
-      location: c.location || '',
-      description: c.description || '',
-    };
+  // Нет времени → спросить время (forceReply), есть → к конфликт-гейту.
+  async function askTimeOrCreate(chatId, ev) {
     if (!ev.time) {
       const key = newPendingKey(chatId);
       const msg = await tg.send(chatId, R.rAskTime(ev.title, zoneLabel(calTz(), now())), { forceReply: true });
@@ -219,6 +236,29 @@ export function createRouter(deps) {
       return;
     }
     await resolveAndMaybeCreate(chatId, ev);
+  }
+
+  async function handleCreate(chatId, c) {
+    const city = c.city ? detectCity(c.city) : null;
+    const ev = {
+      title: (c.title || '').trim(),
+      date: c.date || DateTime.fromMillis(now(), { zone: calTz() }).toISODate(),
+      time: c.time_start || '',
+      tz: city ? city.tz : calTz(),
+      durationMin: computeDuration(c),
+      attendees: c.attendees || [],
+      location: c.location || '',
+      description: c.description || '',
+    };
+    // Правка 23.07: без названия НЕ создаём «Встречу» — спрашиваем название.
+    if (!ev.title) {
+      const key = newPendingKey(chatId);
+      const sent = await tg.send(chatId, R.rAskTitle(), { forceReply: true });
+      state.data.pending[chatId] = { key, kind: 'await_title', action: 'create', ev, createdAt: now(), promptMsgId: sent.message_id };
+      state.save();
+      return;
+    }
+    await askTimeOrCreate(chatId, ev);
   }
 
   function computeDuration(c) {
@@ -271,7 +311,7 @@ export function createRouter(deps) {
   function ambiguousItems(matches) {
     return matches.map((m) => {
       const tt = timesFor(m, calTz());
-      return { title: m.summary, dayMonth: fmtDateRu(tt.local).replace(/ \d{4}$/, ''), clock: tt.clock, t1: tt.t1, zone: tt.zone };
+      return { title: m.summary, dayMonth: fmtDayShort(tt.local), clock: tt.clock, t1: tt.t1, zone: tt.zone };
     });
   }
 
@@ -313,22 +353,28 @@ export function createRouter(deps) {
 
   async function handleDelete(chatId, c, text) {
     const titles = (c.titles && c.titles.length ? c.titles : [c.title]).filter(Boolean);
-    const found = [];
-    let notFound = [];
-    for (const t of titles) {
-      const matches = searchByTitle(t);
-      if (matches.length > 1) {
-        await askWhich(chatId, matches, 'delete', c);
-        return;
+    const attempt = () => {
+      const found = [];
+      let notFound = [];
+      for (const t of titles) {
+        const matches = searchByTitle(t);
+        if (matches.length > 1) return { ambiguous: matches };
+        if (matches.length === 1) found.push(matches[0]);
+        else notFound.push(t);
       }
-      if (matches.length === 1) found.push(matches[0]);
-      else notFound.push(t);
-    }
-    // Фолбэк: названий нет или ни одно не нашлось — ищем имена встреч в самом тексте
-    if (!found.length) {
-      const byText = searchInText(text);
-      if (byText.length) { found.push(...byText); notFound = []; }
-    }
+      // Фолбэк: названий нет или ни одно не нашлось — ищем имена встреч в самом тексте
+      if (!found.length) {
+        const byText = searchInText(text);
+        if (byText.length) return { found: byText, notFound: [] };
+      }
+      return { found, notFound };
+    };
+    let r = attempt();
+    // Промах → возможно, кэш протух (событие только что создали) — обновить и повторить
+    if (!r.ambiguous && !r.found.length) { await refreshCache().catch(() => {}); r = attempt(); }
+    if (r.ambiguous) { await askWhich(chatId, r.ambiguous, 'delete', c); return; }
+    const found = r.found;
+    const notFound = r.notFound;
     if (!found.length) { await tg.send(chatId, R.rNotFound(titles.length ? titles : ['(без названия)'])); return; }
 
     // Защита от случайного удаления: подтверждение кнопками
@@ -341,6 +387,22 @@ export function createRouter(deps) {
       cardHtml: html, promptMsgId: sent.message_id,
     };
     state.save();
+  }
+
+  // Интент find (правка 23.07): «найди/покажи встречу X» → карточки, ничего не меняем.
+  async function handleFind(chatId, c, text) {
+    const titles = (c.titles && c.titles.length ? c.titles : [c.title]).filter(Boolean);
+    const attempt = () => {
+      const found = [];
+      for (const t of titles) found.push(...searchByTitle(t));
+      if (!found.length) found.push(...searchInText(text));
+      const seen = new Set();
+      return found.filter((e) => !seen.has(e.id) && seen.add(e.id));
+    };
+    let found = attempt();
+    if (!found.length) { await refreshCache().catch(() => {}); found = attempt(); }
+    if (!found.length) { await tg.send(chatId, R.rNotFound(titles.length ? titles : ['(без названия)'])); return; }
+    await tg.send(chatId, R.rFound(found.slice(0, CARD_CAP).map((e) => viewFromEvent(e, calTz()))));
   }
 
   // Массовые операции: «удали/перенеси все встречи за период» (с подтверждением).
@@ -410,8 +472,13 @@ export function createRouter(deps) {
   }
 
   async function handleUpdate(chatId, c, text) {
-    let matches = searchByTitle(c.title || '');
-    if (!matches.length) matches = searchInText(text); // фолбэк по тексту сообщения
+    const attempt = () => {
+      let m = searchByTitle(c.title || '');
+      if (!m.length) m = searchInText(text); // фолбэк по тексту сообщения
+      return m;
+    };
+    let matches = attempt();
+    if (!matches.length) { await refreshCache().catch(() => {}); matches = attempt(); }
     if (!matches.length) { await tg.send(chatId, R.rNotFound([c.title || '(без названия)'])); return; }
     if (matches.length > 1) {
       await askWhich(chatId, matches, 'update', c);
@@ -626,6 +693,7 @@ export function createRouter(deps) {
     await tg.answerCallback(cb.id);
     const chatId = cb.message?.chat?.id;
     if (!chatId || cb.from?.id !== cfg.ownerChatId) return;
+    log('btn', cb.data || '');
     if ((cb.data || '').startsWith('set:')) { await handleSettingsCallback(cb); return; }
 
     // Выбор из «Найдено несколько»: cal:pick:<key>:<idx|all>
@@ -740,6 +808,7 @@ export function createRouter(deps) {
         }
       }
       if (!text.trim()) return;
+      log((msg.voice || msg.audio) ? 'voice' : 'msg', text.slice(0, 200));
 
       if (/^\/(start|help)\b/.test(text)) {
         await tg.send(chatId, R.rWelcome());
@@ -771,6 +840,17 @@ export function createRouter(deps) {
       // пока висит ожидание, ЛЮБОЕ сообщение с распознаваемым временем — это ответ,
       // даже если оно пришло не reply'ем (например, после «⚠️ Не понял время»).
       const pending = state.data.pending[chatId];
+
+      // Ответ на вопрос о названии (правка 23.07): пока ждём название,
+      // любой текст без «/» — это название (reply не обязателен).
+      if (pending && pending.kind === 'await_title') {
+        delete state.data.pending[chatId];
+        state.save();
+        const ev = { ...pending.ev, title: text.trim().slice(0, 80) };
+        await askTimeOrCreate(chatId, ev);
+        return;
+      }
+
       if (pending && (pending.kind === 'await_time' || pending.kind === 'await_reschedule')) {
         const isReply = msg.reply_to_message &&
           (msg.reply_to_message.message_id === pending.promptMsgId ||
@@ -793,12 +873,15 @@ export function createRouter(deps) {
         tz,
       });
 
+      log('intent', JSON.stringify(c).slice(0, 300));
+
       switch (c.intent) {
         case 'create': await handleCreate(chatId, c); break;
         case 'today': case 'tomorrow': case 'day_after_tomorrow':
         case 'weekday': case 'week': case 'next_week': case 'specific_date':
           await handleSchedule(chatId, c.intent, c); break;
         case 'delete': await handleDelete(chatId, c, text); break;
+        case 'find': await handleFind(chatId, c, text); break;
         case 'update': await handleUpdate(chatId, c, text); break;
         case 'delete_all': await handleBulk(chatId, c, 'delete'); break;
         case 'move_all': await handleBulk(chatId, c, 'move'); break;
@@ -809,7 +892,9 @@ export function createRouter(deps) {
           await tg.send(chatId, R.rFree(answer));
         }
       }
+      log('done', c.intent);
     } catch (e) {
+      log('err', e.message);
       console.error('router error:', e);
       const chatId = u.message?.chat?.id || u.callback_query?.message?.chat?.id;
       if (chatId) await tg.send(chatId, R.rFail()).catch(() => {});

@@ -92,6 +92,12 @@ export function conflictButtons(pendingKey) {
 // Подсказка про зону (правило А: голое время = зона календаря).
 const tzHint = (zone) => `\n\n<i>⏱ Время без города — в твоей зоне: ${zone}. Хочешь другую — назови город: «на 20 по Москве».</i>`;
 
+// ── Уточнение названия (forceReply) — правка 23.07: дефолт «Встреча» убран ──
+export function rAskTitle() {
+  return head('📝 Как назвать встречу?') +
+    'Ответь на это сообщение названием — например «Созвон с командой».';
+}
+
 // ── 6.5 Уточнение времени (forceReply) ───────────────────────────
 export function rAskTime(title, zone) {
   return head('🕒 На какое время поставить встречу?') +
@@ -207,6 +213,13 @@ export function deleteButtons(pendingKey) {
 }
 export function rDeleteCancelled() {
   return head('❌ Отмена') + 'Ничего не удалил.';
+}
+
+// ── Интент find — найдено по запросу (правка 23.07) ──────────────
+export function rFound(views) {
+  const title = views.length > 1 ? '🔍 Нашёл встречи' : '🔍 Нашёл встречу';
+  return head(title) +
+    views.map((v) => eventBlock(v, { withAttendees: true, withLocation: true, withLinks: true, withOpen: true })).join('\n\n');
 }
 
 // ── 6.15 Встреча не найдена ──────────────────────────────────────

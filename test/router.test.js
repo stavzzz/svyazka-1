@@ -284,8 +284,8 @@ test('п.12: два совпадения → 6.16 с кнопками-номер
   await router.handleUpdate(msg('удали созвон'));
   const ambiguous = deps.tg.sent.at(-1);
   assert.ok(ambiguous.html.startsWith('<b>🔍 Найдено несколько встреч</b>'));
-  assert.ok(ambiguous.html.includes('1) <b>Созвон с Петей</b> — 23 июля, 🕙 10:00 МСК'));
-  assert.ok(ambiguous.html.includes('2) <b>Созвон с Васей</b> — 24 июля, 🕒 15:00 МСК'));
+  assert.ok(ambiguous.html.includes('1) <b>Созвон с Петей</b> — ЧТ, 23 июля, 🕙 10:00 МСК'));
+  assert.ok(ambiguous.html.includes('2) <b>Созвон с Васей</b> — ПТ, 24 июля, 🕒 15:00 МСК'));
   const btns = ambiguous.opts.buttons[0];
   assert.equal(btns.length, 2);
 
@@ -507,4 +507,103 @@ test('intent other → свободный ответ (экранированны
   await router.refreshCache();
   await router.handleUpdate(msg('как дела?'));
   assert.equal(deps.tg.sent.at(-1).html, 'свободный ответ');
+});
+
+// ── Правки 23.07: создание без названия → бот спрашивает название ──
+test('создание без названия: вопрос «Как назвать», ничего не создаётся', async () => {
+  const deps = makeDeps({ classifierMap: {
+    'поставь встречу': { intent: 'create', title: '', date: '2026-07-23', time_start: '23:00' },
+  } });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('поставь встречу завтра на 23:00'));
+  assert.equal(deps.gcal.calls.filter((c) => c[0] === 'create').length, 0);
+  assert.match(deps.tg.sent.at(-1).html, /Как назвать встречу/);
+  assert.equal(deps.state.data.pending[OWNER].kind, 'await_title');
+});
+
+test('ответ названием: встреча создаётся с этим названием', async () => {
+  const deps = makeDeps({ classifierMap: {
+    'поставь встречу': { intent: 'create', title: '', date: '2026-07-23', time_start: '23:00' },
+  } });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('поставь встречу завтра на 23:00'));
+  const ask = deps.tg.sent.at(-1);
+  await router.handleUpdate(msg('Созвон с командой', { reply_to_message: { message_id: ask.message_id, text: ask.html } }));
+  const created = deps.gcal.calls.find((c) => c[0] === 'create');
+  assert.ok(created);
+  assert.equal(created[1].summary, 'Созвон с командой');
+});
+
+test('без названия и без времени: сначала название, потом время', async () => {
+  const deps = makeDeps({ classifierMap: {
+    'поставь встречу': { intent: 'create', title: '', date: '2026-07-23', time_start: '' },
+  } });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('поставь встречу завтра'));
+  assert.match(deps.tg.sent.at(-1).html, /Как назвать встречу/);
+  const ask = deps.tg.sent.at(-1);
+  await router.handleUpdate(msg('Планёрка', { reply_to_message: { message_id: ask.message_id, text: ask.html } }));
+  assert.match(deps.tg.sent.at(-1).html, /На какое время поставить/);
+  assert.match(deps.tg.sent.at(-1).html, /Планёрка/);
+});
+
+// ── Правки 23.07: интент find, поиск без падежей, retry кэша ──
+test('find: карточка найденной встречи, с днём недели', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'найди': { intent: 'find', titles: ['тест колонок'] } },
+    gcalOpts: { events: [rawEvent('k1', 'Тест колонок', '2026-07-26T11:00:00', '2026-07-26T13:00:00')] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('найди встречу тест колонок'));
+  const out = deps.tg.sent.at(-1).html;
+  assert.ok(out.startsWith('<b>🔍 Нашёл'));
+  assert.ok(out.includes('Тест колонок'));
+  assert.ok(out.includes('ВС, 26 июля 2026'));
+});
+
+test('delete: падежи — «встречу тест колонок» находит «Тест колонок»', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'удали': { intent: 'delete', titles: ['встречу тест колонок'] } },
+    gcalOpts: { events: [rawEvent('k1', 'Тест колонок', '2026-07-26T11:00:00', '2026-07-26T13:00:00')] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('удали, пожалуйста, встречу тест колонок'));
+  const out = deps.tg.sent.at(-1).html;
+  assert.ok(out.startsWith('<b>🗑 Удалить встречу?'));
+  assert.ok(out.includes('Тест колонок'));
+});
+
+test('find: промах по кэшу → авто-обновление кэша → находит', async () => {
+  const deps = makeDeps({ classifierMap: { 'найди': { intent: 'find', titles: ['тест колонок'] } } });
+  const router = createRouter(deps);
+  await router.refreshCache(); // кэш пуст
+  deps.gcal.store.push(rawEvent('k2', 'Тест колонок', '2026-07-26T11:00:00', '2026-07-26T13:00:00'));
+  await router.handleUpdate(msg('найди тест колонок'));
+  assert.ok(deps.tg.sent.at(-1).html.includes('Тест колонок'));
+});
+
+test('find: нет нигде → «Встреча не найдена»', async () => {
+  const deps = makeDeps({ classifierMap: { 'найди': { intent: 'find', titles: ['несуществующая'] } } });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('найди несуществующая'));
+  assert.ok(deps.tg.sent.at(-1).html.startsWith('<b>❌ Встреча не найдена'));
+});
+
+// ── Правка 23.07: лог диалога (msg → intent → done) ──
+test('лог диалога: текст, интент и результат попадают в лог', async () => {
+  const lines = [];
+  const deps = makeDeps({ classifierMap: { 'что у меня сегодня': { intent: 'today' } } });
+  deps.log = (...a) => lines.push(a.join(' '));
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('что у меня сегодня'));
+  assert.ok(lines.some((l) => l === 'msg что у меня сегодня'));
+  assert.ok(lines.some((l) => l.startsWith('intent {"intent":"today"')));
+  assert.ok(lines.some((l) => l === 'done today'));
 });

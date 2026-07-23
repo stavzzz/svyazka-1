@@ -5,7 +5,7 @@
 
 const INTENTS = new Set([
   'create', 'today', 'tomorrow', 'day_after_tomorrow', 'weekday', 'week',
-  'next_week', 'specific_date', 'delete', 'update', 'delete_all', 'move_all',
+  'next_week', 'specific_date', 'find', 'delete', 'update', 'delete_all', 'move_all',
   'set_timezone', 'get_timezone', 'other',
 ]);
 
@@ -22,6 +22,7 @@ today, tomorrow, day_after_tomorrow (расписание на сегодня/з
 weekday (расписание на день недели: «что в понедельник»),
 week (эта неделя), next_week (следующая неделя),
 specific_date (расписание на конкретную дату: «что 20 июля»),
+find (найди/покажи/когда у меня встреча X — показать по названию, ничего не менять),
 delete (удали/отмени/убери ОДНУ named встречу),
 update (перенеси/измени/отложи/увеличь/добавь описание или участников к встрече),
 delete_all (удали ВСЕ встречи за период: «удали все встречи сегодня / на этой неделе»),
@@ -32,6 +33,7 @@ other (всё остальное: вопросы, болтовня).
 
 Поля:
 - create: {"intent":"create","title":str,"date":"YYYY-MM-DD","time_start":"HH:MM"|"","time_end":"HH:MM"|"","duration_min":str,"attendees":[emails],"location":str,"description":str,"city":str}
+- find: {"intent":"find","titles":[str]}
 - delete: {"intent":"delete","titles":[str]}
 - update: {"intent":"update","title":str,"date":"YYYY-MM-DD"|"","time_start":"HH:MM"|"","duration_min":str|"","attendees_add":[emails],"description":str,"city":str}
 - weekday|specific_date: {"intent":...,"date":"YYYY-MM-DD"}
@@ -47,7 +49,8 @@ other (всё остальное: вопросы, болтовня).
 4. city — город/регион, если назван («по Москве» → "Москва"), иначе "".
 5. duration_min: «5 минут»→"5", «полчаса»→"30", «2 часа»→"120". Не названа — "60". Для update не названа — "".
 6. Относительные даты считай от сегодняшней: «завтра» → ${ctx.tomorrowISO}. Дата не названа — для create сегодняшняя, для update "".
-7. Ответ — строго один JSON-объект.`;
+7. Ответ — строго один JSON-объект.
+8. Если название встречи НЕ прозвучало — title:"" (ПУСТАЯ строка). НИКОГДА не придумывай название сам («Встреча», «Meeting», «Событие» — запрещено). Слова «встреча/звонок/созвон» сами по себе — НЕ название.`;
 }
 
 // format — ровно два варианта:
@@ -63,6 +66,9 @@ export function createClassifier({ baseUrl, apiKey, model, format = 'minimax', f
           model,
           max_tokens: maxTokens,
           temperature: 0,
+          // Стабильный session-key: gateway OpenClaw создаёт сессию агента на каждый
+          // запрос без него — за день накапливаются сотни пустых сессий.
+          user: 'secretary-bot-v2', // суффикс менять при смене промпта: свежая сессия без старой истории
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
         }),
       });

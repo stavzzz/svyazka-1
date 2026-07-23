@@ -11,6 +11,7 @@ import { rangeFor, fmtDateRu, fmtDayHeader, fmtWeekRange } from '../src/dates.js
 import { findConflicts } from '../src/conflict.js';
 import { parseWhen } from '../src/timeparse.js';
 import { createState, newPendingKey } from '../src/state.js';
+import { viewFromEvent } from '../src/views.js';
 
 // Фиксированное «сейчас»: среда 22 июля 2026, 12:00 МСК
 const NOW = DateTime.fromISO('2026-07-22T12:00:00', { zone: 'Europe/Moscow' }).toMillis();
@@ -151,4 +152,33 @@ test('newPendingKey: формат <chat_id>_<8 симв>, ≤64 байта, бе
   const k = newPendingKey(111111111);
   assert.match(k, /^111111111_[A-Za-z0-9_-]{8}$/);
   assert.ok(Buffer.byteLength(`cal:reschedule:${k}`) <= 64);
+});
+
+// ── views: день недели в датах карточек (правка Стаса 2026-07-23) ──
+test('viewFromEvent: dateRu содержит день недели', () => {
+  const v = viewFromEvent({
+    id: 'x', summary: 'Тест', allDay: false, status: 'confirmed',
+    startMs: DateTime.fromISO('2026-07-26T11:00', { zone: 'Asia/Tbilisi' }).toMillis(),
+    endMs: DateTime.fromISO('2026-07-26T13:00', { zone: 'Asia/Tbilisi' }).toMillis(),
+    tz: 'Asia/Tbilisi', attendees: [], description: '', location: '', meet: '', zoom: '', htmlLink: '',
+  }, 'Asia/Tbilisi');
+  assert.equal(v.dateRu, 'ВС, 26 июля 2026');
+});
+
+// ── Правка 23.07: telegram.edit молчит про «message is not modified» ──
+test('edit: «message is not modified» глотается без console.error, прочие 400 — логируются', async () => {
+  const { createTelegram } = await import('../src/telegram.js');
+  const mk = (desc) => createTelegram({
+    token: 't',
+    fetchFn: async () => ({ status: 400, json: async () => ({ ok: false, description: desc }) }),
+  });
+  const errs = [];
+  const orig = console.error;
+  console.error = (...a) => errs.push(a.join(' '));
+  try {
+    assert.equal(await mk('Bad Request: message is not modified: ...').edit(1, 2, 'x'), null);
+    assert.equal(errs.length, 0);
+    assert.equal(await mk('Bad Request: chat not found').edit(1, 2, 'x'), null);
+    assert.equal(errs.length, 1);
+  } finally { console.error = orig; }
 });
