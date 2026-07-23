@@ -368,10 +368,13 @@ export function createRouter(deps) {
   }
 
   // «Найдено несколько» → pending выбора: кнопки-номера или цифра сообщением.
+  // Кнопки — с днём недели и датой (правка Стаса 23.07): «1 · ПТ, 24 июля».
   async function askWhich(chatId, matches, action, payload) {
     const key = newPendingKey(chatId);
-    const html = R.rAmbiguous(ambiguousItems(matches), action);
-    const sent = await tg.send(chatId, html, { buttons: R.pickButtons(key, matches.length, { withAll: action === 'delete' }) });
+    const items = ambiguousItems(matches);
+    const html = R.rAmbiguous(items, action);
+    const labels = items.map((it, i) => `${i + 1} · ${it.dayMonth}`);
+    const sent = await tg.send(chatId, html, { buttons: R.pickButtons(key, matches.length, { withAll: action === 'delete', labels }) });
     state.data.pending[chatId] = {
       key, kind: 'choose', action, candidates: matches, c: payload, createdAt: now(),
       cardHtml: html, promptMsgId: sent.message_id,
@@ -392,6 +395,7 @@ export function createRouter(deps) {
     delete state.data.pending[chatId];
     state.save();
     await stripButtons(chatId, pending, idx === 'all' ? '☑️ Выбрано: все' : `☑️ Выбрано: ${idx + 1}`);
+    if (pending.action === 'find') { await sendFoundCard(chatId, targets[0]); return; }
     if (pending.action === 'delete') {
       const key = newPendingKey(chatId);
       const html = R.rConfirmDelete(targets.map((t) => viewFromEvent(t, calTz())));
@@ -477,16 +481,21 @@ export function createRouter(deps) {
     let found = attempt();
     if (!found.length) { await refreshCache().catch(() => {}); found = attempt(); }
     if (!found.length) { await tg.send(chatId, R.rNotFound(titles.length ? titles : ['(без названия)'])); return; }
-    const html = R.rFound(found.slice(0, CARD_CAP).map((e) => viewFromEvent(e, calTz())));
-    // Ровно одна — карточка с кнопками действий (тест 46)
-    if (found.length === 1) {
-      const key = newPendingKey(chatId);
-      const sent = await tg.send(chatId, html, { buttons: R.foundButtons(key) });
-      state.data.pending[chatId] = { key, kind: 'found', event: found[0], createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
-      state.save();
+    // Несколько — выбор кнопками с датами (правка Стаса 23.07), одна — сразу карточка
+    if (found.length > 1) {
+      await askWhich(chatId, found.slice(0, CARD_CAP), 'find', c);
       return;
     }
-    await tg.send(chatId, html);
+    await sendFoundCard(chatId, found[0]);
+  }
+
+  // Карточка найденной встречи с кнопками действий (тест 46)
+  async function sendFoundCard(chatId, event) {
+    const html = R.rFound([viewFromEvent(event, calTz())]);
+    const key = newPendingKey(chatId);
+    const sent = await tg.send(chatId, html, { buttons: R.foundButtons(key) });
+    state.data.pending[chatId] = { key, kind: 'found', event, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+    state.save();
   }
 
   // Массовые операции: «удали/перенеси все встречи за период» (с подтверждением).

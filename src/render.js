@@ -273,7 +273,8 @@ export function rNotFound(titles) {
 // ── 6.16 Найдено несколько ───────────────────────────────────────
 // items: [{title, dayMonth:'13 июля', clock, t1, zone}]; action: 'delete'|'update'
 export function rAmbiguous(items, action = 'update') {
-  const q = action === 'delete' ? '🗑 Какую удалить?' : '🔄 Какую изменить?';
+  const q = action === 'delete' ? '🗑 Какую удалить?'
+    : action === 'find' ? '👀 С какой работаем?' : '🔄 Какую изменить?';
   const hint = 'Жми кнопку с номером или напиши цифру.' +
     (action === 'delete' && items.length > 1 ? ' Все сразу — кнопка «Удалить все».' : '');
   return head('🔍 Найдено несколько встреч') +
@@ -282,12 +283,14 @@ export function rAmbiguous(items, action = 'update') {
     `\n\n<i>${hint}</i>`;
 }
 
-// Кнопки-номера для выбора встречи (по 4 в ряд) + «Удалить все» для удаления.
-export function pickButtons(pendingKey, n, { withAll = false } = {}) {
+// Кнопки-номера для выбора встречи + «Удалить все» для удаления.
+// labels (правка Стаса 23.07): подписи «1 · ПТ, 24 июля» — по 2 в ряд.
+export function pickButtons(pendingKey, n, { withAll = false, labels = null } = {}) {
   const rows = [];
-  for (let i = 0; i < n; i += 4) {
-    rows.push(Array.from({ length: Math.min(4, n - i) }, (_, j) => ({
-      text: String(i + j + 1),
+  const per = labels ? 2 : 4;
+  for (let i = 0; i < n; i += per) {
+    rows.push(Array.from({ length: Math.min(per, n - i) }, (_, j) => ({
+      text: labels ? labels[i + j] : String(i + j + 1),
       callback_data: `cal:pick:${pendingKey}:${i + j}`,
     })));
   }
