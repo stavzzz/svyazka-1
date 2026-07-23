@@ -838,6 +838,7 @@ export function createRouter(deps) {
       case 'today': await handleSchedule(chatId, 'today', {}); break;
       case 'tomorrow': await handleSchedule(chatId, 'tomorrow', {}); break;
       case 'week': await handleSchedule(chatId, 'week', {}); break;
+      case 'next_week': await handleSchedule(chatId, 'next_week', {}); break;
       case 'tz': await handleGetTz(chatId); break;
       case 'next': await handleNext(chatId); break;
       case 'free': await handleFree(chatId); break;

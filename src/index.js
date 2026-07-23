@@ -35,6 +35,7 @@ const MENU = [
   { command: 'today', description: '📅 Встречи сегодня' },
   { command: 'tomorrow', description: '📅 Встречи завтра' },
   { command: 'week', description: '📅 Встречи на неделе' },
+  { command: 'next_week', description: '📅 Встречи на следующей неделе' },
   { command: 'next', description: '⏭ Ближайшая встреча + ссылки' },
   { command: 'add', description: '➕ Добавить встречу' },
   { command: 'free', description: '🟢 Свободные окна сегодня' },

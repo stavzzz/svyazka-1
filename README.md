@@ -86,7 +86,7 @@ docker logs secretary-bot   # должно быть: calendar tz: …, menu regi
 ## Проверка
 
 ```bash
-npm install && npm test     # 134 автотеста
+npm install && npm test     # 135 автотестов
 docker compose run --rm secretary-bot node scripts/live-smoke.js   # живые API
 ```
 
@@ -103,7 +103,7 @@ docker compose run --rm secretary-bot node scripts/live-smoke.js   # живые 
 | `src/tz.js` / `src/dates.js` | ~130 городов мира + GMT±N, часовые пояса, диапазоны дат |
 | `src/gcal.js` / `src/zoom.js` / `src/telegram.js` / `src/transcribe.js` | Клиенты API |
 | `src/state.js` / `src/slots.js` / `src/conflict.js` / `src/views.js` | Состояние, свободные окна, конфликты, карточки |
-| `test/` | 134 автотеста (`node --test`) |
+| `test/` | 135 автотестов (`node --test`) |
 
 ## Безопасность
 
