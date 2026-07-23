@@ -240,6 +240,23 @@ export function rAttendeeResponse(v, email, status) {
     eventBlock(v, { withOpen: true });
 }
 
+// Кнопки под найденной встречей (правка Стаса 23.07 вечер, тест 46)
+export function foundButtons(pendingKey) {
+  return [[
+    { text: '🔁 Перенести', callback_data: `cal:fmove:${pendingKey}` },
+    { text: '✏️ Переименовать', callback_data: `cal:fren:${pendingKey}` },
+  ], [
+    { text: '👥 Пригласить', callback_data: `cal:finv:${pendingKey}` },
+    { text: '🗑 Удалить', callback_data: `cal:fdel:${pendingKey}` },
+  ]];
+}
+export function rAskRename() {
+  return head('✏️ Новое название?') + 'Ответь на это сообщение новым названием встречи.';
+}
+export function rAskInvite() {
+  return head('👥 Кого пригласить?') + 'Ответь почтой участника — можно несколько, через запятую.';
+}
+
 // ── Интент find — найдено по запросу (правка 23.07) ──────────────
 export function rFound(views) {
   const title = views.length > 1 ? '🔍 Нашёл встречи' : '🔍 Нашёл встречу';

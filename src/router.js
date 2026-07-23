@@ -247,6 +247,15 @@ export function createRouter(deps) {
 
   // ── Обработчики интентов ─────────────────────────────────────
 
+  // Ответ на вопрос названия: срезаем служебный префикс и кавычки —
+  // «назови встречу "Тест"» → «Тест» (баг со скриншота Стаса 23.07).
+  function cleanTitle(s) {
+    let t = (s || '').trim();
+    t = t.replace(/^(пожалуйста[,\s]+)?(назови|назов[её]м|назвать|название)\s*(встречу|е[её]|это)?\s*[:—-]?\s*/i, '');
+    t = t.replace(/^["«'`]+/, '').replace(/["»'`]+$/, '').trim();
+    return (t || s.trim()).slice(0, 80);
+  }
+
   // «в 8» без «утра/вечера» — неоднозначно (правка 23.07 вечер): 1–11 часов,
   // ровный час, в тексте голое число без маркера и без двоеточия.
   function ampmAmbiguous(text, time) {
@@ -468,7 +477,16 @@ export function createRouter(deps) {
     let found = attempt();
     if (!found.length) { await refreshCache().catch(() => {}); found = attempt(); }
     if (!found.length) { await tg.send(chatId, R.rNotFound(titles.length ? titles : ['(без названия)'])); return; }
-    await tg.send(chatId, R.rFound(found.slice(0, CARD_CAP).map((e) => viewFromEvent(e, calTz()))));
+    const html = R.rFound(found.slice(0, CARD_CAP).map((e) => viewFromEvent(e, calTz())));
+    // Ровно одна — карточка с кнопками действий (тест 46)
+    if (found.length === 1) {
+      const key = newPendingKey(chatId);
+      const sent = await tg.send(chatId, html, { buttons: R.foundButtons(key) });
+      state.data.pending[chatId] = { key, kind: 'found', event: found[0], createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+      state.save();
+      return;
+    }
+    await tg.send(chatId, html);
   }
 
   // Массовые операции: «удали/перенеси все встречи за период» (с подтверждением).
@@ -802,6 +820,44 @@ export function createRouter(deps) {
     log('btn', cb.data || '');
     if ((cb.data || '').startsWith('set:')) { await handleSettingsCallback(cb); return; }
 
+    // Кнопки под «Нашёл встречу»: cal:fmove|fren|finv|fdel:<key> (тест 46)
+    const fnd = /^cal:(fmove|fren|finv|fdel):(.+)$/.exec(cb.data || '');
+    if (fnd) {
+      const pending = state.data.pending[chatId];
+      if (!pending || pending.kind !== 'found' || pending.key !== fnd[2]) {
+        await tg.send(chatId, R.rStaleButton());
+        return;
+      }
+      const e = pending.event;
+      delete state.data.pending[chatId];
+      state.save();
+      if (fnd[1] === 'fdel') {
+        await stripButtons(chatId, pending, '🗑 Удалить');
+        const key = newPendingKey(chatId);
+        const html = R.rConfirmDelete([viewFromEvent(e, calTz())]);
+        const sent = await tg.send(chatId, html, { buttons: R.deleteButtons(key) });
+        state.data.pending[chatId] = { key, kind: 'confirm', action: 'delete', events: [e], notFound: [], createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+        state.save();
+        return;
+      }
+      if (fnd[1] === 'fmove') {
+        await stripButtons(chatId, pending, '🔁 Перенести');
+        const tz = e.tz || calTz();
+        const s = DateTime.fromMillis(e.startMs, { zone: tz });
+        const ev = { title: e.summary, date: s.toISODate(), time: s.toFormat('HH:mm'), tz, durationMin: Math.round((e.endMs - e.startMs) / 60000) };
+        const msg2 = await tg.send(chatId, R.rAskNewTime(zoneLabel(calTz(), now())), { forceReply: true });
+        state.data.pending[chatId] = { kind: 'await_reschedule', action: 'move', ev, eventId: e.id, createdAt: now(), promptMsgId: msg2.message_id };
+        state.save();
+        return;
+      }
+      const isRen = fnd[1] === 'fren';
+      await stripButtons(chatId, pending, isRen ? '✏️ Переименовать' : '👥 Пригласить');
+      const msg2 = await tg.send(chatId, isRen ? R.rAskRename() : R.rAskInvite(), { forceReply: true });
+      state.data.pending[chatId] = { kind: isRen ? 'await_rename' : 'await_invite', event: e, createdAt: now(), promptMsgId: msg2.message_id };
+      state.save();
+      return;
+    }
+
     // Кнопки «утра/вечера»: cal:am|pm:<key> (правка 23.07 вечер)
     const ampm = /^cal:(am|pm):(.+)$/.exec(cb.data || '');
     if (ampm) {
@@ -974,12 +1030,37 @@ export function createRouter(deps) {
       // даже если оно пришло не reply'ем (например, после «⚠️ Не понял время»).
       const pending = state.data.pending[chatId];
 
+      // Ответ на «Новое название?» / «Кого пригласить?» (кнопки под «Нашёл встречу», тест 46)
+      if (pending && (pending.kind === 'await_rename' || pending.kind === 'await_invite')) {
+        delete state.data.pending[chatId];
+        state.save();
+        try {
+          let patch;
+          if (pending.kind === 'await_rename') {
+            const nt = cleanTitle(text);
+            if (!nt) { await tg.send(chatId, R.rFail()); return; }
+            patch = { summary: nt };
+          } else {
+            const emails = text.match(/[\w.+-]+@[\w.-]+\.\w+/g) || [];
+            if (!emails.length) { await tg.send(chatId, R.rFail()); return; }
+            patch = { attendees: [...new Set([...(pending.event.attendees || []), ...emails])].map((em) => ({ email: em })) };
+          }
+          const raw = await gcal.patchEvent(pending.event.id, patch);
+          await refreshCache();
+          await tg.send(chatId, R.rUpdated(viewFromEvent(normEvent(raw), calTz())));
+        } catch (e) {
+          console.error('found action failed:', e.message);
+          await tg.send(chatId, R.rCalError());
+        }
+        return;
+      }
+
       // Ответ на вопрос о названии (правка 23.07): пока ждём название,
       // любой текст без «/» — это название (reply не обязателен).
       if (pending && pending.kind === 'await_title') {
         delete state.data.pending[chatId];
         state.save();
-        const ev = { ...pending.ev, title: text.trim().slice(0, 80) };
+        const ev = { ...pending.ev, title: cleanTitle(text) };
         if (pending.ampm && ev.time) { await askAmPm(chatId, ev, 'create'); return; }
         await askTimeOrCreate(chatId, ev);
         return;
