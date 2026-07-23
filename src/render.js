@@ -105,6 +105,13 @@ export function ampmButtons(pendingKey) {
   ]];
 }
 
+// ── «Это время уже в прошлом» (правка Стаса 24.07) ───────────────
+export function rPastTime(v) {
+  return head('⏰ Это время уже в прошлом') +
+    eventBlock(v) +
+    '\n\nЧто делаем — поставить всё равно, выбрать другое время или отменить?';
+}
+
 // ── Уточнение названия (forceReply) — правка 23.07: дефолт «Встреча» убран ──
 export function rAskTitle() {
   return head('📝 Как назвать встречу?') +

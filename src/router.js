@@ -108,9 +108,18 @@ export function createRouter(deps) {
     });
   }
 
-  // ── Создание: конфликт-гейт → создать ────────────────────────
+  // ── Создание: гейт прошлого времени → конфликт-гейт → создать ─
   async function resolveAndMaybeCreate(chatId, ev) {
     const { startMs, endMs, view } = pendingView(ev);
+    // Встреча в прошлом (правка Стаса 24.07): тот же 3-кнопочный флоу, что и конфликт
+    if (endMs <= now()) {
+      const key = newPendingKey(chatId);
+      const html = R.rPastTime(view);
+      const sent = await tg.send(chatId, html, { buttons: R.conflictButtons(key) });
+      state.data.pending[chatId] = { key, kind: 'confirm', action: 'create', ev, createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+      state.save();
+      return;
+    }
     const conflicts = findConflicts(startMs, endMs, state.data.cache.events.filter((e) => !e.allDay && !e.transparent));
     if (conflicts.length) {
       const key = newPendingKey(chatId);
@@ -178,6 +187,15 @@ export function createRouter(deps) {
 
   async function resolveAndMaybeMove(chatId, pending) {
     const { startMs, endMs, view } = pendingView(pending.ev);
+    // Перенос в прошлое — тот же гейт (правка Стаса 24.07)
+    if (endMs <= now()) {
+      const key = newPendingKey(chatId);
+      const html = R.rPastTime(view);
+      const sent = await tg.send(chatId, html, { buttons: R.conflictButtons(key) });
+      state.data.pending[chatId] = { ...pending, key, kind: 'confirm', createdAt: now(), cardHtml: html, promptMsgId: sent.message_id };
+      state.save();
+      return;
+    }
     const conflicts = findConflicts(startMs, endMs,
       state.data.cache.events.filter((e) => !e.allDay && !e.transparent), pending.eventId);
     if (conflicts.length) {
