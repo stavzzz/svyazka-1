@@ -665,10 +665,11 @@ test('№8 перенос двух названных встреч одной ф
   const patches = deps.gcal.calls.filter((c) => c[0] === 'patch');
   assert.equal(patches.length, 2);
   assert.ok(patches.every((p) => p[2].start.dateTime.startsWith('2026-07-26')));
-  const out = deps.tg.sent.at(-1).html;
-  assert.match(out, /перенесены/);
-  assert.match(out, /Чтение книги/);
-  assert.match(out, /Прогулка по квартире/);
+  // Отдельное сообщение на каждую (правка Стаса 23.07 ночь-3)
+  const moved = deps.tg.sent.filter((m) => m.html.includes('перенесена'));
+  assert.equal(moved.length, 2);
+  assert.ok(moved.some((m) => m.html.includes('Чтение книги')));
+  assert.ok(moved.some((m) => m.html.includes('Прогулка по квартире')));
 });
 
 test('№10 «на 8» без утра/вечера → вопрос; «Вечера» → 20:00', async () => {
@@ -869,4 +870,63 @@ test('«перенеси на час вперёд» → shift_min=60, время
   const out = deps.tg.sent.at(-1).html;
   assert.match(out, /перенесена/);
   assert.match(out, /18:00 – 20:00/);
+});
+
+// ── Правки 23.07 (ночь-4): «Тест а» ≠ «Тест б», мульти-перенос: отдельные сообщения + конфликт-гейт ──
+test('«Тест а» и «Тест б»: точное совпадение, без дублей', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'перенеси': { intent: 'update', title: '', titles: ['Тест а', 'Тест б'], date: '2026-07-26', time_start: '' } },
+    gcalOpts: { events: [
+      rawEvent('ta', 'Тест а', '2026-07-25T15:00:00', '2026-07-25T16:00:00'),
+      rawEvent('tb', 'Тест б', '2026-07-25T18:00:00', '2026-07-25T19:00:00'),
+    ] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('перенеси Тест а и Тест б на воскресенье'));
+  const patches = deps.gcal.calls.filter((c) => c[0] === 'patch');
+  assert.equal(patches.length, 2);                          // ровно по одному патчу на встречу
+  const moved = deps.tg.sent.filter((m) => m.html.includes('перенесена'));
+  assert.equal(moved.length, 2);                            // отдельное сообщение на каждую
+  assert.ok(moved[0].html.includes('Тест а') && !moved[0].html.includes('Тест б'));
+  assert.ok(moved[1].html.includes('Тест б') && !moved[1].html.includes('Тест а'));
+});
+
+test('мульти-перенос: у одной конфликт → стандартное окно конфликта, «Всё равно» → перенесена', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'перенеси': { intent: 'update', title: '', titles: ['Тест а', 'Тест б'], date: '2026-07-26', time_start: '' } },
+    gcalOpts: { events: [
+      rawEvent('ta', 'Тест а', '2026-07-25T15:00:00', '2026-07-25T16:00:00'),
+      rawEvent('tb', 'Тест б', '2026-07-25T18:00:00', '2026-07-25T19:00:00'),
+      rawEvent('busy', 'Ходьба', '2026-07-26T18:30:00', '2026-07-26T19:30:00'), // конфликт для Тест б
+    ] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('перенеси Тест а и Тест б на воскресенье'));
+  // Тест а без конфликта — перенесена сразу отдельным сообщением
+  assert.ok(deps.tg.sent.some((m) => m.html.includes('перенесена') && m.html.includes('Тест а')));
+  // Тест б — конфликтная карточка со стандартными кнопками
+  const conflict = deps.tg.sent.at(-1);
+  assert.ok(conflict.html.startsWith('<b>⚠️ Конфликт времени</b>'));
+  assert.ok(conflict.html.includes('Тест б'));
+  await router.handleUpdate(cb(conflict.opts.buttons[0][0].callback_data)); // «Всё равно»
+  assert.ok(deps.tg.sent.at(-1).html.includes('перенесена'));
+  assert.equal(deps.gcal.calls.filter((c) => c[0] === 'patch').length, 2);
+});
+
+test('«удали Тест а» не трогает «Тест б» (точный матч в приоритете)', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'удали': { intent: 'delete', titles: ['Тест а'] } },
+    gcalOpts: { events: [
+      rawEvent('ta', 'Тест а', '2026-07-25T15:00:00', '2026-07-25T16:00:00'),
+      rawEvent('tb', 'Тест б', '2026-07-25T18:00:00', '2026-07-25T19:00:00'),
+    ] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('удали Тест а'));
+  const out = deps.tg.sent.at(-1).html;
+  assert.ok(out.startsWith('<b>🗑 Удалить встречу?'));       // одна, без вопроса «какую»
+  assert.ok(out.includes('Тест а') && !out.includes('Тест б'));
 });

@@ -173,6 +173,7 @@ export function createRouter(deps) {
     const raw = await gcal.patchEvent(eventId, patch);
     await refreshCache();
     await tg.send(chatId, R.rMoved([viewFromEvent(normEvent(raw), calTz())]));
+    await nextFromQueue(chatId, pending); // очередь мульти-переноса
   }
 
   async function resolveAndMaybeMove(chatId, pending) {
@@ -221,13 +222,25 @@ export function createRouter(deps) {
     return q.every((qw) => t.some((tw) => tokenPair(qw, tw)));
   }
 
+  // Все токены, включая односимвольные («Тест а» ≠ «Тест б»; баг 23.07 ночь-3).
+  function wordsAll(s) {
+    return (s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9\s]/gi, ' ')
+      .split(/\s+/).filter(Boolean);
+  }
+  function exactKey(s) { return wordsAll(s).filter((w) => !STOP_WORDS.has(w)).join(' '); }
+
   function searchByTitle(title) {
     const q = (title || '').trim();
     if (!q) return [];
-    return state.data.cache.events.filter((e) =>
-      e.status !== 'cancelled' &&
-      e.endMs > now() - 3600_000 &&
-      titleMatches(q, e.summary));
+    const base = state.data.cache.events.filter((e) =>
+      e.status !== 'cancelled' && e.endMs > now() - 3600_000);
+    // Точное совпадение названия — в приоритете, нечёткий поиск только при промахе
+    const k = exactKey(q);
+    if (k) {
+      const exact = base.filter((e) => exactKey(e.summary) === k);
+      if (exact.length) return exact;
+    }
+    return base.filter((e) => titleMatches(q, e.summary));
   }
 
   // Фолбэк: классификатор не вытащил название (запятые, обороты) —
@@ -564,27 +577,48 @@ export function createRouter(deps) {
     await tg.send(chatId, R.rDeleted(pending.events.map((e) => viewFromEvent(e, calTz())), pending.notFound));
   }
 
-  // Несколько названных встреч одной фразой: «перенеси X и Y на завтра» (правка 23.07 вечер).
+  // Несколько названных встреч одной фразой: «перенеси X и Y на завтра».
+  // Правка Стаса 23.07 ночь-3: отдельное сообщение на каждую; конфликтные —
+  // по очереди через стандартный конфликт-гейт (queue в pending).
   async function moveNamed(chatId, targets, c) {
-    const moved = [];
+    const seen = new Set();
+    targets = targets.filter((e) => !seen.has(e.id) && seen.add(e.id)); // дедуп
+    const deferred = [];
     for (const target of targets) {
       const tz = target.tz || calTz();
       const oldStart = DateTime.fromMillis(target.startMs, { zone: tz });
-      const durMs = target.endMs - target.startMs;
-      const date = c.date || oldStart.toISODate();
-      const time = c.time_start || oldStart.toFormat('HH:mm');
-      const s = DateTime.fromISO(`${date}T${time}`, { zone: tz });
+      const ev = {
+        title: target.summary,
+        date: c.date || oldStart.toISODate(),
+        time: c.time_start || oldStart.toFormat('HH:mm'),
+        tz,
+        durationMin: Math.round((target.endMs - target.startMs) / 60000),
+      };
+      const { startMs, endMs } = pendingView(ev);
+      const conflicts = findConflicts(startMs, endMs,
+        state.data.cache.events.filter((e) => !e.allDay && !e.transparent), target.id);
+      if (conflicts.length) { deferred.push({ ev, eventId: target.id }); continue; }
       try {
+        const s = DateTime.fromISO(`${ev.date}T${ev.time}`, { zone: tz });
         const raw = await gcal.patchEvent(target.id, {
           start: { dateTime: s.toISO(), timeZone: tz },
-          end: { dateTime: s.plus({ milliseconds: durMs }).toISO(), timeZone: tz },
+          end: { dateTime: s.plus({ minutes: ev.durationMin }).toISO(), timeZone: tz },
         });
-        moved.push(normEvent(raw));
-      } catch (e) { console.error('move named failed:', e.message); }
+        await refreshCache();
+        await tg.send(chatId, R.rMoved([viewFromEvent(normEvent(raw), calTz())]));
+      } catch (e) { console.error('move named failed:', e.message); await tg.send(chatId, R.rCalError()); }
     }
-    await refreshCache();
-    if (!moved.length) { await tg.send(chatId, R.rCalError()); return; }
-    await tg.send(chatId, R.rMoved(moved.map((m) => viewFromEvent(m, calTz()))));
+    if (deferred.length) {
+      const [first, ...rest] = deferred;
+      await resolveAndMaybeMove(chatId, { kind: 'confirm', action: 'move', ev: first.ev, eventId: first.eventId, queue: rest });
+    }
+  }
+
+  // Следующая конфликтная из очереди мульти-переноса (после Да/Отмены).
+  async function nextFromQueue(chatId, pending) {
+    if (!pending.queue?.length) return;
+    const [next, ...rest] = pending.queue;
+    await resolveAndMaybeMove(chatId, { kind: 'confirm', action: 'move', ev: next.ev, eventId: next.eventId, queue: rest });
   }
 
   async function handleUpdate(chatId, c, text) {
@@ -930,6 +964,7 @@ export function createRouter(deps) {
       if (pending.action === 'move_all') { await tg.send(chatId, R.rMoveCancelled()); return; }
       const { view } = pendingView(pending.ev);
       await tg.send(chatId, R.rCancelled(view));
+      await nextFromQueue(chatId, pending); // очередь мульти-переноса: отмена одной не стопит остальные
       return;
     }
     if (action === 'add') {
