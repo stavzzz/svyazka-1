@@ -283,17 +283,13 @@ export function rAmbiguous(items, action = 'update') {
     `\n\n<i>${hint}</i>`;
 }
 
-// Кнопки-номера для выбора встречи + «Удалить все» для удаления.
-// labels (правка Стаса 23.07): подписи «1 · ПТ, 24 июля» — по 2 в ряд.
+// Кнопки выбора встречи: 1 кнопка = 1 ряд, в один столбец (правка Стаса 23.07),
+// подпись «1 · ПТ, 24 июля»; + «Удалить все» для удаления.
 export function pickButtons(pendingKey, n, { withAll = false, labels = null } = {}) {
-  const rows = [];
-  const per = labels ? 2 : 4;
-  for (let i = 0; i < n; i += per) {
-    rows.push(Array.from({ length: Math.min(per, n - i) }, (_, j) => ({
-      text: labels ? labels[i + j] : String(i + j + 1),
-      callback_data: `cal:pick:${pendingKey}:${i + j}`,
-    })));
-  }
+  const rows = Array.from({ length: n }, (_, i) => [{
+    text: labels ? labels[i] : String(i + 1),
+    callback_data: `cal:pick:${pendingKey}:${i}`,
+  }]);
   if (withAll && n > 1) rows.push([{ text: '🗑 Удалить все', callback_data: `cal:pick:${pendingKey}:all` }]);
   return rows;
 }

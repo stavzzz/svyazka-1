@@ -35,7 +35,7 @@ other (всё остальное: вопросы, болтовня).
 - create: {"intent":"create","title":str,"date":"YYYY-MM-DD","time_start":"HH:MM"|"","time_end":"HH:MM"|"","duration_min":str,"attendees":[emails],"location":str,"description":str,"city":str}
 - find: {"intent":"find","titles":[str],"date":"YYYY-MM-DD"|"","time_start":"HH:MM"|""}
 - delete: {"intent":"delete","titles":[str],"date":"YYYY-MM-DD"|"","time_start":"HH:MM"|""}
-- update: {"intent":"update","title":str,"titles":[str],"new_title":str|"","date":"YYYY-MM-DD"|"","time_start":"HH:MM"|"","duration_min":str|"","attendees_add":[emails],"description":str,"city":str}
+- update: {"intent":"update","title":str,"titles":[str],"new_title":str|"","date":"YYYY-MM-DD"|"","time_start":"HH:MM"|"","shift_min":str|"","duration_min":str|"","attendees_add":[emails],"description":str,"city":str}
 - weekday|specific_date: {"intent":...,"date":"YYYY-MM-DD"}
 - delete_all: {"intent":"delete_all","range":"today|tomorrow|week|next_week|specific_date","date":"YYYY-MM-DD"|""}
 - move_all: {"intent":"move_all","range":"today|tomorrow|week|next_week|specific_date","date":"","shift_days":"7"} — «на неделю вперёд»→"7", «на день/на завтра»→"1", «на два дня»→"2". Период не назван → range:"week".
@@ -53,7 +53,9 @@ other (всё остальное: вопросы, болтовня).
 8. Если название встречи НЕ прозвучало — title:"" (ПУСТАЯ строка). НИКОГДА не придумывай название сам («Встреча», «Meeting», «Событие» — запрещено). Слова «встреча/звонок/созвон» сами по себе — НЕ название.
 9. «Переименуй X в Y» / «назови X иначе: Y» → update, title:"X", new_title:"Y".
 10. Для find/delete/update встречу можно указать БЕЗ названия — датой и временем («встречу в воскресенье в 11», «сегодняшнюю встречу в 20:00»): тогда titles:[], date и time_start заполни.
-11. «Перенеси X и Y на завтра» (несколько названных встреч) → update, titles:["X","Y"], date.`;
+11. «Перенеси X и Y на завтра» (несколько названных встреч) → update, titles:["X","Y"], date.
+12. Относительный сдвиг: «перенеси на час вперёд/позже» → update, shift_min:"60"; «на 30 минут раньше/назад» → shift_min:"-30". time_start при этом НЕ заполняй.
+13. Просьба ТОЛЬКО найти/показать (без изменений) — ВСЕГДА intent find, даже если названы день или время.`;
 }
 
 // format — ровно два варианта:
@@ -71,7 +73,7 @@ export function createClassifier({ baseUrl, apiKey, model, format = 'minimax', f
           temperature: 0,
           // Стабильный session-key: gateway OpenClaw создаёт сессию агента на каждый
           // запрос без него — за день накапливаются сотни пустых сессий.
-          user: 'secretary-bot-v3', // суффикс менять при смене промпта: свежая сессия без старой истории
+          user: 'secretary-bot-v4', // суффикс менять при смене промпта: свежая сессия без старой истории
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
         }),
       });

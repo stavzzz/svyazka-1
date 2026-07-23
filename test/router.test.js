@@ -286,8 +286,8 @@ test('п.12: два совпадения → 6.16 с кнопками-номер
   assert.ok(ambiguous.html.startsWith('<b>🔍 Найдено несколько встреч</b>'));
   assert.ok(ambiguous.html.includes('1) <b>Созвон с Петей</b> — ЧТ, 23 июля, 🕙 10:00 МСК'));
   assert.ok(ambiguous.html.includes('2) <b>Созвон с Васей</b> — ПТ, 24 июля, 🕒 15:00 МСК'));
-  const btns = ambiguous.opts.buttons[0];
-  assert.equal(btns.length, 2);
+  const btns = ambiguous.opts.buttons.flat();      // 1 кнопка = 1 ряд (правка 23.07)
+  assert.equal(btns.length, 3);                    // 2 выбора + «Удалить все»
 
   await router.handleUpdate(cb(btns[1].callback_data)); // выбрал №2
   const confirm = deps.tg.sent.at(-1);
@@ -824,4 +824,49 @@ test('find: несколько одинаковых → «С какой рабо
   assert.match(card.html, /СБ, 25 июля 2026/);
   assert.deepEqual(card.opts.buttons.flat().map((b) => b.text),
     ['🔁 Перенести', '✏️ Переименовать', '👥 Пригласить', '🗑 Удалить']);
+});
+
+// ── Правки 23.07 (ночь-3): столбец кнопок, «обновлена» при rename, сдвиг «на час вперёд» ──
+test('выбор встречи: 1 кнопка = 1 ряд (один столбец)', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'найди': { intent: 'find', titles: ['ходьба'] } },
+    gcalOpts: { events: [
+      rawEvent('c1', 'Ходьба', '2026-07-24T21:00:00', '2026-07-24T22:00:00'),
+      rawEvent('c2', 'Ходьба', '2026-07-25T21:00:00', '2026-07-25T22:00:00'),
+      rawEvent('c3', 'Ходьба', '2026-07-26T21:00:00', '2026-07-26T22:00:00'),
+    ] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('найди ходьба'));
+  const rows = deps.tg.sent.at(-1).opts.buttons;
+  assert.equal(rows.length, 3);
+  assert.ok(rows.every((r) => r.length === 1));
+});
+
+test('rename с той же датой → «Встреча обновлена», не «перенесена»', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'переименуй': { intent: 'update', title: 'тест', new_title: 'Жопа сатаны', date: '2026-07-26' } },
+    gcalOpts: { events: [rawEvent('rn1', 'Тест', '2026-07-26T17:00:00', '2026-07-26T18:00:00')] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('переименуй тест в жопу сатаны'));
+  const out = deps.tg.sent.at(-1).html;
+  assert.match(out, /Встреча обновлена/);
+  assert.match(out, /Жопа сатаны/);
+  assert.ok(!/перенесена/.test(out));
+});
+
+test('«перенеси на час вперёд» → shift_min=60, время сдвинуто', async () => {
+  const deps = makeDeps({
+    classifierMap: { 'тренер в зале': { intent: 'update', title: 'тренер в зале', shift_min: '60', date: '2026-07-24' } },
+    gcalOpts: { events: [rawEvent('sh1', 'Тренер в зале', '2026-07-24T17:00:00', '2026-07-24T19:00:00')] },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('завтрашнюю встречу тренер в зале перенеси на час вперед'));
+  const out = deps.tg.sent.at(-1).html;
+  assert.match(out, /перенесена/);
+  assert.match(out, /18:00 – 20:00/);
 });

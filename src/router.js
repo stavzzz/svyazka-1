@@ -619,8 +619,26 @@ export function createRouter(deps) {
   }
 
   async function applyUpdate(chatId, target, c) {
-    const timeChanged = Boolean(c.date || c.time_start);
     const newTitle = (c.new_title || '').trim(); // переименование (правка 23.07 вечер)
+    const tz0 = target.tz || calTz();
+    const oldStart0 = DateTime.fromMillis(target.startMs, { zone: tz0 });
+
+    // Относительный сдвиг: «перенеси на час вперёд/на 30 минут раньше» (правка 23.07 ночь-3)
+    const shiftMin = parseInt(c.shift_min, 10) || 0;
+    if (shiftMin) {
+      const s = oldStart0.plus({ minutes: shiftMin });
+      const ev = {
+        title: newTitle || target.summary,
+        date: s.toISODate(), time: s.toFormat('HH:mm'), tz: tz0,
+        durationMin: Math.round((target.endMs - target.startMs) / 60000),
+      };
+      await resolveAndMaybeMove(chatId, { kind: 'confirm', action: 'move', ev, eventId: target.id, newTitle });
+      return;
+    }
+
+    // Время «изменилось», только если названо новое время или ДРУГАЯ дата —
+    // «переименуй встречу в воскресенье» (дата та же) не считается переносом.
+    const timeChanged = Boolean(c.time_start) || (Boolean(c.date) && c.date !== oldStart0.toISODate());
 
     if (timeChanged) {
       const city = c.city ? detectCity(c.city) : null;
