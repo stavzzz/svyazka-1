@@ -115,10 +115,13 @@ function yearFor(startDT, month, day) {
 // → {none:true} | {count:N} | {untilISO:'YYYY-MM-DD'} | null (не понял)
 export function parseRecurEnd(text, startDT) {
   const t = (text || '').toLowerCase().replace(/ё/g, 'е');
-  if (/бессрочн|без конца|навсегда|без окончани|пока не отменю|всегда/.test(t)) return { none: true };
+  // «бес+рочн» — ловит и опечатку «бесрочно» (приёмка 24.07)
+  if (/бес+рочн|без конца|навсегда|навечно|постоянно|без окончани|пока не отменю|всегда/.test(t)) return { none: true };
   let m = t.match(/(\d+)\s*раз/);
   if (m) return { count: Math.max(1, +m[1]) };
-  if (/до конца года/.test(t)) return { untilISO: `${startDT.year}-12-31` };
+  m = t.match(/до конца (\d{4})/); // «до конца 2026 года» (приёмка 24.07)
+  if (m) return { untilISO: `${m[1]}-12-31` };
+  if (/до конца (этого )?года/.test(t)) return { untilISO: `${startDT.year}-12-31` };
   if (/до конца/.test(t)) {
     const mo = monthFromText(t);
     if (mo) {
@@ -163,8 +166,10 @@ function joinRu(items) {
   return items.slice(0, -1).join(', ') + ' и ' + items.at(-1);
 }
 
-// → «еженедельно по ПН и ПТ · до ПТ, 18 сентября (16 занятий)»
-export function describeRecur(recur, startDT, occurrencesCount = 0) {
+// → «еженедельно по ПН и ПТ · до ПТ, 18 сентября (16 занятий)».
+// lastDT — дата ПОСЛЕДНЕГО занятия: в карточке она честнее, чем дата-ограничитель
+// UNTIL (правка Стаса 24.07: «на 8 недель» давало «до ЧТ», хотя занятия по ПН и ПТ).
+export function describeRecur(recur, startDT, occurrencesCount = 0, lastDT = null) {
   let freqPart;
   if (recur.freq === 'daily') {
     freqPart = recur.interval > 1 ? `раз в ${recur.interval} ${plural(recur.interval, 'день', 'дня', 'дней')}` : 'ежедневно';
@@ -175,9 +180,11 @@ export function describeRecur(recur, startDT, occurrencesCount = 0) {
   }
   const bydayPart = recur.byday.length ? ` по ${joinRu(recur.byday.map((d) => BYDAY_RU[d]))}` : '';
   let endPart;
-  if (recur.count > 0) endPart = `${recur.count} раз`;
-  else if (recur.untilISO) {
-    const until = DateTime.fromISO(recur.untilISO, { zone: startDT.zoneName });
+  if (recur.count > 0) {
+    endPart = `${recur.count} раз`;
+    if (lastDT) endPart += ` · до ${fmtDayShort(lastDT)}`;
+  } else if (recur.untilISO) {
+    const until = lastDT || DateTime.fromISO(recur.untilISO, { zone: startDT.zoneName });
     endPart = `до ${fmtDayShort(until)}`;
     if (occurrencesCount > 0) endPart += ` (${occurrencesCount} ${plural(occurrencesCount, 'занятие', 'занятия', 'занятий')})`;
   } else endPart = 'бессрочно';

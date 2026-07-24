@@ -122,6 +122,27 @@ test('parseRecurEnd: непонятный ответ → null', () => {
   assert.equal(parseRecurEnd('ну как пойдёт', dt('2026-07-27T11:00:00')), null);
 });
 
+test('parseRecurEnd: правки приёмки 24.07 — «до конца 2026 года», опечатка «бесрочно»', () => {
+  assert.deepEqual(parseRecurEnd('до конца 2026 года', dt('2026-07-27T11:00:00')), { untilISO: '2026-12-31' });
+  assert.deepEqual(parseRecurEnd('до конца 2027', dt('2026-07-27T11:00:00')), { untilISO: '2027-12-31' });
+  assert.deepEqual(parseRecurEnd('бесрочно', dt('2026-07-27T11:00:00')), { none: true });
+  assert.deepEqual(parseRecurEnd('до конца этого года', dt('2026-07-27T11:00:00')), { untilISO: '2026-12-31' });
+});
+
+test('describeRecur: lastDT — дата последнего занятия вместо даты-ограничителя (правка 24.07)', () => {
+  // «на 8 недель» с ПТ 24.07: until ЧТ 17.09, но последнее занятие — ПН 14.09
+  const s = describeRecur(
+    { freq: 'weekly', byday: ['MO', 'FR'], interval: 1, count: 0, untilISO: '2026-09-17' },
+    dt('2026-07-24T05:00:00'), 16, dt('2026-09-14T05:00:00'),
+  );
+  assert.equal(s, 'еженедельно по ПН и ПТ · до ПН, 14 сентября (16 занятий)');
+  // count-серия с известным концом
+  assert.equal(
+    describeRecur({ freq: 'weekly', byday: ['TU'], interval: 1, count: 10, untilISO: '' },
+      dt('2026-07-28T10:00:00'), 10, dt('2026-09-29T10:00:00')),
+    'еженедельно по ВТ · 10 раз · до ВТ, 29 сентября');
+});
+
 // ── describeRecur ────────────────────────────────────────────────
 
 test('describeRecur: еженедельно по дням с until и счётчиком занятий', () => {

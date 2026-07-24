@@ -364,8 +364,19 @@ export function createRouter(deps) {
 
   function recurDescOf(ev) {
     const first = firstStartOf(ev);
-    const occ = ev.recur.untilISO ? expandOccurrences(ev.recur, first) : [];
-    return describeRecur(ev.recur, first, occ.length);
+    const rules = ev.recur.endless ? { ...ev.recur, count: 0, untilISO: '' } : ev.recur;
+    // Для конечных серий показываем дату ПОСЛЕДНЕГО занятия (правка Стаса 24.07)
+    const bounded = rules.count > 0 || rules.untilISO;
+    const occ = bounded ? expandOccurrences(rules, first) : [];
+    return describeRecur(rules, first, occ.length, occ.at(-1) || null);
+  }
+
+  // Сообщение во время доспроса серии оказалось НОВОЙ командой («Поставь…») —
+  // бросаем цепочку и пускаем текст в классификатор (приёмка 24.07: команда
+  // «Поставь каждую СБ…» съедалась вопросом «Докуда повторять?»).
+  function looksLikeNewCommand(text) {
+    return /^(поставь|создай|запланируй|добавь|забронируй|запиши|удали|отмени|убери|перенеси|сдвинь|найди|покажи|переименуй|что у меня|какие встречи)/i
+      .test((text || '').trim());
   }
 
   // Карточка серии с подтверждением (перед конфликт-гейтом).
@@ -467,6 +478,9 @@ export function createRouter(deps) {
       else if (e?.count) ev.recur.count = e.count;
       else if (e?.untilISO) ev.recur.untilISO = e.untilISO;
     }
+    // Несколько встреч одной фразой: первая — в работу, об остальных предупреждаем
+    // (приёмка 24.07: «Тест 2» терялся молча).
+    if (c.more_titles?.length) await tg.send(chatId, R.rMoreTitles(c.more_titles.filter(Boolean)));
     const ampm = Boolean(ev.time) && ampmAmbiguous(text, ev.time);
     // Правка 23.07: без названия НЕ создаём «Встречу» — спрашиваем название.
     if (!ev.title) {
@@ -1582,7 +1596,7 @@ export function createRouter(deps) {
       }
 
       // Ответ на «Как часто повторять?» — серия без частоты (24.07)
-      if (pending && pending.kind === 'await_recur_freq') {
+      if (pending && pending.kind === 'await_recur_freq' && !looksLikeNewCommand(text)) {
         // «ПН в 6:30 и ВС в 5:00» — два времени одной серией не бывает (баг приёмки):
         // честно просим по одной. Диапазоны «с 11 до 12:30» не считаются.
         const times = new Set((text.replace(/с\s*\d{1,2}[:.]\d{2}\s*до\s*\d{1,2}[:.]\d{2}/g, ' ')
@@ -1600,7 +1614,7 @@ export function createRouter(deps) {
       }
 
       // Ответ на «Докуда повторять?» (24.07)
-      if (pending && pending.kind === 'await_recur_end') {
+      if (pending && pending.kind === 'await_recur_end' && !looksLikeNewCommand(text)) {
         const first = DateTime.fromISO(`${pending.ev.date}T${pending.ev.time}`, { zone: pending.ev.tz });
         const e = parseRecurEnd(text, first);
         if (!e) { await tg.send(chatId, R.rBadRecurEnd()); return; }
@@ -1612,6 +1626,13 @@ export function createRouter(deps) {
         else recur.untilISO = e.untilISO;
         await askTimeOrCreate(chatId, { ...pending.ev, recur });
         return;
+      }
+
+      // Новая команда прервала доспрос серии — цепочка сброшена, текст пойдёт
+      // в классификатор обычным путём (24.07).
+      if (pending && (pending.kind === 'await_recur_freq' || pending.kind === 'await_recur_end')) {
+        delete state.data.pending[chatId];
+        state.save();
       }
 
       // Ответ текстом на вопрос «утра или вечера?» (кнопки — в handleCallback)
