@@ -172,6 +172,16 @@ export function createRouter(deps) {
     const nev = normEvent(raw);
     if (!nev.tz) nev.tz = ev.tz;
     await tg.send(chatId, R.rCreated(viewFromEvent(nev, calTz())));
+    await nextFromCreateQueue(chatId); // «несколько встреч одной фразой»
+  }
+
+  // Очередь «несколько встреч одной фразой» (24.07): одна готова — сразу следующая.
+  async function nextFromCreateQueue(chatId) {
+    const q = state.data.createQueue || [];
+    const item = q.shift();
+    state.save();
+    if (!item || now() - (item.ts || 0) > 3600_000) return; // пусто или протухла
+    await handleCreate(chatId, item.c, item.text);
   }
 
   // ── Перенос существующего события ────────────────────────────
@@ -451,6 +461,7 @@ export function createRouter(deps) {
     const view = viewFromEvent(nev, calTz());
     view.recurDesc = desc;
     await tg.send(chatId, R.rCreated(view));
+    await nextFromCreateQueue(chatId); // «несколько встреч одной фразой»
   }
 
   async function handleCreate(chatId, c, text) {
@@ -478,9 +489,24 @@ export function createRouter(deps) {
       else if (e?.count) ev.recur.count = e.count;
       else if (e?.untilISO) ev.recur.untilISO = e.untilISO;
     }
-    // Несколько встреч одной фразой: первая — в работу, об остальных предупреждаем
-    // (приёмка 24.07: «Тест 2» терялся молча).
-    if (c.more_titles?.length) await tg.send(chatId, R.rMoreTitles(c.more_titles.filter(Boolean)));
+    // Несколько встреч одной фразой (приёмка 24.07): остальные разбираем сразу
+    // (отдельный вызов классификатора на каждую) и ставим в очередь — после
+    // первой бот сам продолжит.
+    const moreTitles = (c.more_titles || []).filter(Boolean);
+    if (moreTitles.length) {
+      await tg.send(chatId, R.rMoreTitles(moreTitles));
+      for (const t of moreTitles) {
+        try {
+          const c2 = await classifier.classify(`${text}\n\n(Разбери ТОЛЬКО встречу «${t}».)`, classifyCtx());
+          if (c2.intent === 'create') {
+            delete c2.more_titles; // защита от зацикливания
+            state.data.createQueue = state.data.createQueue || [];
+            state.data.createQueue.push({ c: c2, text, ts: now() });
+          }
+        } catch (e) { console.error('queue classify failed:', e.message); }
+      }
+      state.save();
+    }
     const ampm = Boolean(ev.time) && ampmAmbiguous(text, ev.time);
     // Правка 23.07: без названия НЕ создаём «Встречу» — спрашиваем название.
     if (!ev.title) {
@@ -1240,8 +1266,9 @@ export function createRouter(deps) {
           { buttons: R.settingsButtons(state.data.settings) });
         break;
       case 'new': {
-        const hadPending = Boolean(state.data.pending[chatId]);
+        const hadPending = Boolean(state.data.pending[chatId]) || Boolean(state.data.createQueue?.length);
         delete state.data.pending[chatId];
+        state.data.createQueue = []; // и очередь «несколько встреч одной фразой»
         state.save();
         await tg.send(chatId, R.rReset(hadPending));
         break;
@@ -1415,6 +1442,7 @@ export function createRouter(deps) {
       const { view } = pendingView(pending.ev);
       await tg.send(chatId, R.rCancelled(view));
       await nextFromQueue(chatId, pending); // очередь мульти-переноса: отмена одной не стопит остальные
+      await nextFromCreateQueue(chatId); // очередь создания: отмена первой не теряет вторую
       return;
     }
     if (action === 'add') {
