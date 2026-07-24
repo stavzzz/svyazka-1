@@ -396,6 +396,7 @@ export function createRouter(deps) {
     const desc = recurDescOf(ev);
     const { view } = pendingView(ev);
     view.recurDesc = desc;
+    view.recurFirst = true;
     const key = newPendingKey(chatId);
     const html = R.rConfirmRecur(view);
     const sent = await tg.send(chatId, html, { buttons: R.recurButtons(key) });
@@ -410,7 +411,7 @@ export function createRouter(deps) {
     const busy = state.data.cache.events.filter((e) => !e.allDay && !e.transparent);
     const occ = expandOccurrences(ev.recur, first);
     const bad = occ.filter((o) => findConflicts(o.toMillis(), o.toMillis() + durMs, busy).length);
-    if (!bad.length) { await doCreateRecur(chatId, ev, desc, []); return; }
+    if (!bad.length) { await doCreateRecur(chatId, ev, []); return; }
     const items = bad.slice(0, 5).map((o) => {
       const c0 = findConflicts(o.toMillis(), o.toMillis() + durMs, busy)[0];
       const t = timesFor(c0, calTz());
@@ -418,6 +419,7 @@ export function createRouter(deps) {
     });
     const { view } = pendingView({ ...ev, date: first.toISODate() });
     view.recurDesc = desc;
+    view.recurFirst = true;
     const key = newPendingKey(chatId);
     const html = R.rRecurConflict(view, items, Math.max(0, bad.length - 5));
     const sent = await tg.send(chatId, html, { buttons: R.recurConflictButtons(key) });
@@ -430,9 +432,26 @@ export function createRouter(deps) {
 
   // Создание серии: RRULE (+EXDATE при «Пропустить эти дни»), Meet на серию,
   // Zoom один на серию (ссылка в описании — как у обычной встречи).
-  async function doCreateRecur(chatId, ev, desc, exdateISOs) {
-    const start = firstStartOf(ev);
+  // Правка Стаса 24.07 (тест 62): после пропуска дней карточка и RRULE считаются
+  // по РЕАЛЬНЫМ занятиям — старт с первого оставшегося, целиком выпавший день
+  // недели исчезает из BYDAY и описания, счётчик и «до …» по факту.
+  async function doCreateRecur(chatId, ev, exdateISOs) {
+    const WD_CODES = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
+    const rules0 = ev.recur.endless ? { ...ev.recur, count: 0, untilISO: '' } : ev.recur;
+    const exMs = new Set(exdateISOs.map((s) => DateTime.fromISO(s, { zone: ev.tz }).toMillis()));
+    const occReal = expandOccurrences(rules0, firstStartOf(ev)).filter((o) => !exMs.has(o.toMillis()));
+    if (!occReal.length) { await tg.send(chatId, R.rRecurAllSkipped()); return; }
+    const daysLeft = new Set(occReal.map((o) => WD_CODES[o.weekday - 1]));
+    const rules = rules0.byday.length ? { ...rules0, byday: rules0.byday.filter((c) => daysLeft.has(c)) } : rules0;
+    // EXDATE оставляем только для точечных пропусков в живых днях недели
+    const keepEx = exdateISOs
+      .map((s) => DateTime.fromISO(s, { zone: ev.tz }))
+      .filter((d) => !rules.byday.length || daysLeft.has(WD_CODES[d.weekday - 1]));
+    const start = occReal[0];
     const end = start.plus({ minutes: ev.durationMin });
+    const desc = describeRecur(
+      { ...rules, count: rules.count > 0 ? occReal.length : 0 }, // «N раз» — по факту
+      start, occReal.length, occReal.at(-1));
     let zoomUrl = '';
     if (zoom.enabled) {
       try {
@@ -442,9 +461,7 @@ export function createRouter(deps) {
     }
     let description = ev.description || '';
     if (zoomUrl) description = (description ? description + '\n\n' : '') + `Zoom: ${zoomUrl}`;
-    const rules = ev.recur.endless ? { ...ev.recur, count: 0, untilISO: '' } : ev.recur;
-    const recurrence = withExdates(buildRecurrence(rules, start),
-      exdateISOs.map((s) => DateTime.fromISO(s, { zone: ev.tz })));
+    const recurrence = withExdates(buildRecurrence(rules, start), keepEx);
     const raw = await gcal.createEvent({
       summary: ev.title,
       startISO: start.toISO(),
@@ -460,6 +477,7 @@ export function createRouter(deps) {
     if (!nev.tz) nev.tz = ev.tz;
     const view = viewFromEvent(nev, calTz());
     view.recurDesc = desc;
+    view.recurFirst = true; // 🗓 «Первая встреча в …»
     await tg.send(chatId, R.rCreated(view));
     await nextFromCreateQueue(chatId); // «несколько встреч одной фразой»
   }
@@ -1370,7 +1388,7 @@ export function createRouter(deps) {
       delete state.data.pending[chatId];
       state.save();
       await stripButtons(chatId, pending, '⏭ Пропустить эти дни');
-      await doCreateRecur(chatId, pending.ev, pending.recurDesc, pending.exdates);
+      await doCreateRecur(chatId, pending.ev, pending.exdates);
       return;
     }
 
@@ -1456,7 +1474,7 @@ export function createRouter(deps) {
       else if (pending.action === 'move_all') await doMoveAll(chatId, pending);
       else if (pending.action === 'move') await doMove(chatId, pending);
       else if (pending.action === 'create_recur') await recurGateOrCreate(chatId, pending.ev, pending.recurDesc);
-      else if (pending.action === 'create_recur_conflict') await doCreateRecur(chatId, pending.ev, pending.recurDesc, []);
+      else if (pending.action === 'create_recur_conflict') await doCreateRecur(chatId, pending.ev, []);
       else await doCreate(chatId, pending.ev);
       return;
     }

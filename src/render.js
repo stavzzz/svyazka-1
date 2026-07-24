@@ -16,7 +16,8 @@ export const esc = (s) => String(s || '')
 function eventBlock(v, { boldTime = true, withAttendees = false, withLocation = false, withDescription = false, withLinks = false, withOpen = false } = {}) {
   const g1 = [];
   g1.push(`📌 <b>${esc(v.title)}</b>`);
-  g1.push(`🗓 ${v.dateRu}`);
+  // Для карточек создания серии — «Первая встреча в …» (правка Стаса 24.07)
+  g1.push(`🗓 ${v.recurFirst ? 'Первая встреча в ' : ''}${v.dateRu}`);
   const t = `${v.t1} – ${v.t2} ${v.zone}`;
   g1.push(`${v.clock} ${boldTime ? `<b>${t}</b>` : t}`);
   if (v.alt) g1.push(`${v.alt.clock} ${v.alt.t1} – ${v.alt.t2} ${v.alt.zone}`);
@@ -475,6 +476,12 @@ export function rAskRecurFreq(title) {
 export function rMoreTitles(titles) {
   return head('📝 Ставлю по очереди') +
     `Сначала первая встреча, потом сам продолжу со: <b>${titles.map(esc).join(', ')}</b>.`;
+}
+
+// «Пропустить эти дни» съело ВСЕ занятия — серию не ставим (тест 62, 24.07).
+export function rRecurAllSkipped() {
+  return head('🤷 Ставить нечего') +
+    'Все занятия серии выпали на занятые дни — серию не создаю.\nПоменяй время или поставь заново и выбери «✅ Всё равно».';
 }
 
 // Разные времена в разные дни — одной серией не бывает (RRULE), честно говорим.

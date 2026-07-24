@@ -501,6 +501,85 @@ test('серия п.23 (баг 24.07): две встречи одной фраз
   assert.deepEqual(created, ['Тест 1', 'Тест 2']);
 });
 
+test('серия п.24 (тест 62 Стаса): день выпал целиком → старт с первого реального, BYDAY без него, честный счётчик', async () => {
+  // Оба ПН заняты → у Пилатеса (ПН+СР, 2 недели) остаются только среды
+  const busy = [
+    rawEvent('b1', 'Йога', '2026-07-27T11:00:00', '2026-07-27T12:00:00'),
+    rawEvent('b2', 'Йога', '2026-08-03T11:00:00', '2026-08-03T12:00:00'),
+  ];
+  const deps = makeDeps({
+    classifierMap: {
+      'пилатес': {
+        intent: 'create', title: 'Пилатес', date: '2026-07-24', time_start: '11:00', duration_min: '60',
+        recur: { freq: 'weekly', byday: ['MO', 'WE'], interval: '1', count: '', until: '2026-08-05' },
+      },
+    },
+    gcalOpts: { events: busy },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('пилатес каждый ПН и СР в 11:00 на 2 недели'));
+  await router.handleUpdate(cb(btn(deps, 0, 0))); // ✅ Поставить → конфликты
+  assert.ok(deps.tg.sent.at(-1).html.startsWith('<b>⚠️ Конфликты в серии</b>'));
+  await router.handleUpdate(cb(btn(deps, 0, 1))); // ⏭ Пропустить эти дни
+
+  const created = deps.gcal.calls.find((c) => c[0] === 'create')[1];
+  assert.equal(created.start.dateTime.slice(0, 16), '2026-07-29T11:00'); // первая РЕАЛЬНАЯ — СР
+  assert.deepEqual(created.recurrence, ['RRULE:FREQ=WEEKLY;BYDAY=WE;UNTIL=20260805T205959Z']); // без ПН и без EXDATE
+  const out = deps.tg.sent.at(-1).html;
+  assert.ok(out.includes('🗓 Первая встреча в СР, 29 июля 2026'));
+  assert.ok(out.includes('🔁 еженедельно по СР · до СР, 5 августа (2 занятия)'));
+});
+
+test('серия п.25: точечный пропуск (день жив) → EXDATE остаётся, старт с первого реального', async () => {
+  // Занят только один ПН из двух → ПН остаётся в BYDAY, но с EXDATE
+  const busy = [rawEvent('b1', 'Йога', '2026-07-27T11:00:00', '2026-07-27T12:00:00')];
+  const deps = makeDeps({
+    classifierMap: {
+      'пилатес': {
+        intent: 'create', title: 'Пилатес', date: '2026-07-24', time_start: '11:00', duration_min: '60',
+        recur: { freq: 'weekly', byday: ['MO', 'WE'], interval: '1', count: '', until: '2026-08-05' },
+      },
+    },
+    gcalOpts: { events: busy },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('пилатес каждый ПН и СР в 11:00 на 2 недели'));
+  await router.handleUpdate(cb(btn(deps, 0, 0)));
+  await router.handleUpdate(cb(btn(deps, 0, 1))); // ⏭
+  const created = deps.gcal.calls.find((c) => c[0] === 'create')[1];
+  assert.equal(created.start.dateTime.slice(0, 16), '2026-07-29T11:00');
+  assert.deepEqual(created.recurrence, [
+    'RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20260805T205959Z',
+    'EXDATE;TZID=Europe/Moscow:20260727T110000',
+  ]);
+  assert.ok(deps.tg.sent.at(-1).html.includes('(3 занятия)')); // 4 − 1 пропуск
+});
+
+test('серия п.26: пропуск съел ВСЕ занятия → серия не создаётся, честное сообщение', async () => {
+  const busy = [
+    rawEvent('b1', 'Йога', '2026-07-27T11:00:00', '2026-07-27T12:00:00'),
+    rawEvent('b2', 'Йога', '2026-08-03T11:00:00', '2026-08-03T12:00:00'),
+  ];
+  const deps = makeDeps({
+    classifierMap: {
+      'пилатес': {
+        intent: 'create', title: 'Пилатес', date: '2026-07-24', time_start: '11:00', duration_min: '60',
+        recur: { freq: 'weekly', byday: ['MO'], interval: '1', count: '', until: '2026-08-05' },
+      },
+    },
+    gcalOpts: { events: busy },
+  });
+  const router = createRouter(deps);
+  await router.refreshCache();
+  await router.handleUpdate(msg('пилатес каждый ПН в 11:00 на 2 недели'));
+  await router.handleUpdate(cb(btn(deps, 0, 0)));
+  await router.handleUpdate(cb(btn(deps, 0, 1))); // ⏭ — а занятий не осталось
+  assert.ok(deps.tg.sent.at(-1).html.startsWith('<b>🤷 Ставить нечего</b>'));
+  assert.equal(deps.gcal.calls.some((c) => c[0] === 'create'), false);
+});
+
 test('серия п.16: отмена на кнопках объёма → «ничего не удалил»', async () => {
   const deps = makeDeps({
     classifierMap: { 'удали йогу': { intent: 'delete', titles: ['Йога'], series_scope: '' } },
